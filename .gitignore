@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.dll
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+venv/
+env/
+.env
+.venv/
+
+# IDE (PyCharm)
+.idea/
+*.iml
+*.iws
+.vscode/
+
+# Temporary files
+debug_*.png
+*.log
+*.tmp
+
+# Old and test scripts
+*.png
+*.csv
+define_pdf_data_type.py
+extract_pump_curves.py
+PDF_curves_extractor_with_CV.py
+PDF_graph_extractor.py
+test_install.py
