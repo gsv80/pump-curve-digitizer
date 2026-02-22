@@ -112,20 +112,31 @@ class Curve:
 @dataclass
 class PumpCurve(Curve):
     pump_number: int = 0
-    diameter: float = 0.0
+    variant_type: str = "diameter"   # "diameter" or "stages"
+    variant_value: float = 0.0
     has_npsh: bool = False
     has_efficiency: bool = False
+
+    @property
+    def diameter(self) -> Optional[float]:
+        return self.variant_value if self.variant_type == "diameter" else None
 
 @dataclass
 class NPSHCurve(Curve):
     pump_number: int = 0
-    diameter: float = 0.0
+    variant_type: str = "diameter"
+    variant_value: float = 0.0
+
+    @property
+    def diameter(self) -> Optional[float]:
+        return self.variant_value if self.variant_type == "diameter" else None
 
 @dataclass
 class EfficiencyPoint:
     pump_curve_name: str
     pump_number: int
-    diameter: float
+    variant_type: str
+    variant_value: float
     x_px: int
     y_px: int
     efficiency_value: float
@@ -138,16 +149,16 @@ class FittedCurve:
     curve_type: str  # 'pump' or 'npsh'
     points_px: List[Tuple[float, float]]
     points_real: List[Tuple[float, float]]
-    coefficients: List[float]  # Polynomial coefficients [a, b, c, d] for ax³+bx²+cx+d
+    coefficients: List[float]
     x_range: Tuple[float, float]
     y_range: Tuple[float, float]
     rmse: float
     confidence: float
+    variant_type: str = "diameter"
+    variant_value: float = 0.0
     efficiency_points: List[Tuple[float, float]] = field(default_factory=list)
-    # New fields for efficiency curve fitting (4th degree polynomial)
-    efficiency_coefficients: Optional[List[float]] = None  # [a4, a3, a2, a1, a0] for a4*x^4 + a3*x^3 + a2*x^2 + a1*x + a0
+    efficiency_coefficients: Optional[List[float]] = None
     efficiency_rmse: Optional[float] = None
-    # NEW: efficiency x-range (min and max from actual efficiency points)
     efficiency_x_min: Optional[float] = None
     efficiency_x_max: Optional[float] = None
 
@@ -166,6 +177,10 @@ class PumpCurveDigitizer:
         self.original_image = None
         self.graph_rect = None
         self.calibration = None
+
+        # For zoom feature: store last mouse coordinates to display magnified panel
+        self.last_mouse_x = -1
+        self.last_mouse_y = -1
 
         # Curves data
         self.pump_curves: List[PumpCurve] = []
@@ -194,6 +209,8 @@ class PumpCurveDigitizer:
         self.trim_allowed: bool = False
         self.impeller_options: List[Dict] = []
         self.current_diameter: float = 0.0
+        # Pump type: "single" for single-stage with impeller trimming, "multi" for multi-stage
+        self.pump_type: str = "single"
 
     def reset_for_new_page(self):
         """
@@ -238,6 +255,57 @@ class PumpCurveDigitizer:
         print(f"✅ Graph area selected: ({x}, {y}, {w}, {h})")
         return True
 
+    def draw_zoom_panel(self, img: np.ndarray, mouse_x: int, mouse_y: int,
+                        zoom_factor: int = 5, panel_size: int = 100) -> np.ndarray:
+        """
+        Draw a magnified panel in the top-right corner of the image.
+
+        Args:
+            img: The base image to draw on (will be modified)
+            mouse_x, mouse_y: Current mouse coordinates (in the original image)
+            zoom_factor: Magnification factor (e.g., 5 = 5x zoom)
+            panel_size: Size of the square panel in pixels (width and height)
+
+        Returns:
+            The image with the zoom panel added (same as input, modified in place)
+        """
+        h, w = img.shape[:2]
+
+        # Calculate the region to zoom (centered on mouse, size = panel_size/zoom_factor)
+        roi_size = panel_size // zoom_factor
+        half = roi_size // 2
+
+        # Clamp coordinates to stay within image bounds
+        x_center = np.clip(mouse_x, 0, w - 1)
+        y_center = np.clip(mouse_y, 0, h - 1)
+
+        x1 = max(0, x_center - half)
+        x2 = min(w, x_center + half + (roi_size % 2))  # ensure we get exactly roi_size if possible
+        y1 = max(0, y_center - half)
+        y2 = min(h, y_center + half + (roi_size % 2))
+
+        # Extract the region of interest (ROI)
+        roi = img[y1:y2, x1:x2]
+
+        # If ROI is smaller than expected (at edges), we still need to resize it
+        # Create a temporary square canvas (black) and paste the ROI
+        temp = np.zeros((roi_size, roi_size, 3), dtype=np.uint8)
+        temp[:roi.shape[0], :roi.shape[1]] = roi
+
+        # Resize to panel_size
+        zoomed = cv2.resize(temp, (panel_size, panel_size), interpolation=cv2.INTER_NEAREST)
+
+        # Draw a white border and a small crosshair in the center of the zoomed panel
+        cv2.rectangle(zoomed, (0, 0), (panel_size - 1, panel_size - 1), (255, 255, 255), 1)
+        cx, cy = panel_size // 2, panel_size // 2
+        cv2.line(zoomed, (cx - 5, cy), (cx + 5, cy), (0, 255, 0), 1)
+        cv2.line(zoomed, (cx, cy - 5), (cx, cy + 5), (0, 255, 0), 1)
+
+        # Paste the zoom panel into the top-right corner of the original image
+        img[10:10 + panel_size, w - panel_size - 10:w - 10] = zoomed
+
+        return img
+
     def calibrate_axes(self):
         """Step 2: Calibrate all axes by clicking two points per axis."""
         print("\n📐 STEP 2: Axis Calibration (Two points per axis)")
@@ -278,6 +346,9 @@ class PumpCurveDigitizer:
 
         def mouse_callback(event, x, y, flags, param):
             nonlocal skip_npsh, skip_eff
+            # Store mouse position for zoom panel
+            self.last_mouse_x, self.last_mouse_y = x, y
+
             if event == cv2.EVENT_LBUTTONDOWN:
                 idx = len(calib_points)
                 if idx >= len(expected_points):
@@ -286,42 +357,40 @@ class PumpCurveDigitizer:
                 desc = expected_points[idx][1]
                 print(f"\nPoint {idx + 1}: {desc}")
 
-                # Draw point
-                img_copy = self.image.copy()
-                for i, (px, py, _) in enumerate(calib_points):
-                    cv2.circle(img_copy, (px, py), 5, self.colors['calibration'], -1)
-                    cv2.putText(img_copy, str(i + 1), (px + 10, py - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['calibration'], 2)
+                # Draw point (will be redrawn in the updated display)
+                calib_points.append((x, y, expected_points[idx][0]))
 
-                cv2.circle(img_copy, (x, y), 5, self.colors['calibration'], -1)
-                cv2.putText(img_copy, str(idx + 1), (x + 10, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['calibration'], 2)
-                cv2.imshow(self.window_name, img_copy)
-
-                # Ask for value
+                # Ask for value (same as before)
                 if "first point" in desc and ("NPSH" in desc or "efficiency" in desc):
-                    # For NPSH and efficiency first points, ask if they want to skip this axis
                     choice = input(f"  Enter value for {desc} (or 's' to skip this axis): ").strip()
                     if choice.lower() == 's':
-                        # Skip this and the next point of this axis
                         if "NPSH" in desc:
                             skip_npsh = True
                         elif "efficiency" in desc:
                             skip_eff = True
                         print(f"  Skipping {desc.split()[0]} axis.")
-                        # We still need to record the click but with dummy value? Actually we skip entirely.
-                        # To keep indexing consistent, we'll just not add these two points.
-                        # We'll handle by not incrementing calib_points for skipped ones.
-                        # But the click event already happened; we need to prevent adding.
-                        # Let's just return without adding.
+                        # Remove the last point if skipped
+                        calib_points.pop()
                         return
                     else:
                         value = float(choice)
                 else:
                     value = float(input(f"  Enter real value: ").strip())
 
-                calib_points.append((x, y, expected_points[idx][0]))
                 values.append(value)
+
+            # Always update display to show zoom and already clicked points
+            img_disp = self.image.copy()
+            for i, (px, py, label) in enumerate(calib_points):
+                cv2.circle(img_disp, (px, py), 5, self.colors['calibration'], -1)
+                cv2.putText(img_disp, str(i + 1), (px + 10, py - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['calibration'], 2)
+
+            # If mouse is inside the image, draw zoom panel
+            if 0 <= x < self.image.shape[1] and 0 <= y < self.image.shape[0]:
+                self.draw_zoom_panel(img_disp, x, y)
+
+            cv2.imshow(self.window_name, img_disp)
 
         cv2.setMouseCallback(self.window_name, mouse_callback)
 
@@ -453,9 +522,9 @@ class PumpCurveDigitizer:
 
     def get_pump_info(self):
         """
-        Step: Gather pump metadata from the user.
-        Asks for pump model, rated speed (rpm), and whether impeller trimming is allowed.
-        This information will be stored and later included in the JSON export.
+        Gather pump metadata from the user.
+        Asks for pump model, rated speed (rpm), pump type (single/multi-stage),
+        and whether impeller trimming is allowed (for single-stage).
         """
         print("\nℹ️ PUMP INFORMATION")
 
@@ -470,18 +539,27 @@ class PumpCurveDigitizer:
             print("⚠️ Invalid number, setting rpm to 0.")
             self.rpm = 0
 
-        # Ask if the impeller can be trimmed to match a duty point
-        trim = input("Can impeller be trimmed to match duty point? (y/n): ").strip().lower()
-        self.trim_allowed = (trim == 'y')
+        # Ask for pump type
+        pump_type_input = input("Pump type: (s)ingle-stage with impeller trimming, (m)ulti-stage? ").strip().lower()
+        self.pump_type = "single" if pump_type_input.startswith('s') else "multi"
+        print(f"✅ Pump type: {'single-stage' if self.pump_type == 'single' else 'multi-stage'}")
+
+        # For single-stage, ask about trimming
+        if self.pump_type == "single":
+            trim = input("Can impeller be trimmed to match duty point? (y/n): ").strip().lower()
+            self.trim_allowed = (trim == 'y')
+        else:
+            self.trim_allowed = False  # Not applicable for multi-stage
 
         # Confirm the entered data
-        print(f"✅ Pump model: {self.pump_model}, rpm: {self.rpm}, trim_allowed={self.trim_allowed}")
+        print(
+            f"✅ Pump model: {self.pump_model}, rpm: {self.rpm}, type: {self.pump_type}, trim_allowed={self.trim_allowed}")
 
     def digitize_curves(self):
         """
-        Digitize all curves for a single pump with multiple impeller diameters.
+        Digitize all curves for a single pump with multiple variants (impeller diameters or stages).
 
-        Steps for each diameter:
+        Steps for each variant:
             - Q-H curve (mandatory)
             - NPSH curve (optional)
             - Efficiency points (optional)
@@ -489,9 +567,9 @@ class PumpCurveDigitizer:
         All points are stored in the corresponding curve objects.
         """
         print("\n📊 STEP 3: Digitize Curves")
-        print("\nNow we will digitize curves for different impeller diameters.")
+        print("\nNow we will digitize curves for different variants.")
 
-        num_curves = int(input("How many impeller diameters (curves) are shown? ").strip())
+        num_curves = int(input("How many variants (curves) are shown? ").strip())
 
         # Clear any previously stored curves (for a fresh start)
         self.pump_curves.clear()
@@ -503,19 +581,31 @@ class PumpCurveDigitizer:
         cv2.resizeWindow(self.window_name, 1200, 800)
 
         for curve_idx in range(num_curves):
-            print(f"\n--- Curve #{curve_idx + 1} ---")
-            diam = float(input(f"  Diameter for curve #{curve_idx + 1} (mm): ").strip())
-            self.current_diameter = diam
+            print(f"\n--- Variant #{curve_idx + 1} ---")
+
+            # Ask for variant information based on pump type
+            if self.pump_type == "single":
+                variant_value = float(input(f"  Diameter for variant #{curve_idx + 1} (mm): ").strip())
+                variant_type = "diameter"
+                variant_label = f"Diameter {variant_value} mm"
+            else:
+                variant_value = int(input(f"  Number of stages for variant #{curve_idx + 1}: ").strip())
+                variant_type = "stages"
+                variant_label = f"{variant_value} stages"
+
+            self.current_variant_value = variant_value
+            self.current_variant_type = variant_type
 
             # --- Digitize Q-H curve ---
-            print(f"\n  Now digitize the Q-H curve for diameter {diam} mm.")
+            print(f"\n  Now digitize the Q-H curve for {variant_label}.")
             print("  Click points along the curve. Include start and end.")
             print("  Press 'c' when done with this curve.")
 
             pump_curve = PumpCurve(
                 name=f"Pump_{curve_idx + 1}",
                 pump_number=curve_idx + 1,
-                diameter=diam,
+                variant_type=variant_type,
+                variant_value=variant_value,
                 color=self.colors['pump']
             )
             self.pump_curves.append(pump_curve)
@@ -523,27 +613,37 @@ class PumpCurveDigitizer:
             points_temp = []  # temporary storage for points of this curve
 
             def mouse_callback_qh(event, x, y, flags, param):
-                """Mouse callback for Q-H curve digitization."""
+                # Store mouse position for zoom
+                self.last_mouse_x, self.last_mouse_y = x, y
+
                 if event == cv2.EVENT_LBUTTONDOWN:
                     points_temp.append((x, y))
-                    # Update display
-                    img_disp = self.image.copy()
-                    for (px, py) in points_temp:
-                        cv2.circle(img_disp, (px, py), 4, self.colors['pump'], -1)
-                    if len(points_temp) > 1:
-                        pts = np.array(points_temp, np.int32)
-                        cv2.polylines(img_disp, [pts], False, self.colors['pump'], 2)
-                    cv2.putText(img_disp, f"Diameter {diam} mm - Q-H", (10, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['pump'], 2)
-                    cv2.putText(img_disp, f"Points: {len(points_temp)}", (10, 60),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-                    cv2.imshow(self.window_name, img_disp)
+
+                # Update display
+                img_disp = self.image.copy()
+                for (px, py) in points_temp:
+                    cv2.circle(img_disp, (px, py), 4, self.colors['pump'], -1)
+                if len(points_temp) > 1:
+                    pts = np.array(points_temp, np.int32)
+                    cv2.polylines(img_disp, [pts], False, self.colors['pump'], 2)
+
+                # Show variant label
+                cv2.putText(img_disp, f"{variant_label} - Q-H", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['pump'], 2)
+                cv2.putText(img_disp, f"Points: {len(points_temp)}", (10, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+                # Draw zoom panel if mouse is inside image
+                if 0 <= x < self.image.shape[1] and 0 <= y < self.image.shape[0]:
+                    self.draw_zoom_panel(img_disp, x, y)
+
+                cv2.imshow(self.window_name, img_disp)
 
             cv2.setMouseCallback(self.window_name, mouse_callback_qh)
 
             # Initial display with instructions
             img_disp = self.image.copy()
-            cv2.putText(img_disp, f"Diameter {diam} mm - Q-H", (10, 30),
+            cv2.putText(img_disp, f"{variant_label} - Q-H", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['pump'], 2)
             cv2.putText(img_disp, "Click points, press 'c' when done", (10, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
@@ -560,15 +660,17 @@ class PumpCurveDigitizer:
                 pump_curve.add_point(x, y)
 
             # --- Optionally digitize NPSH curve ---
-            has_npsh = input(f"\n  Does this diameter ({diam} mm) have an NPSH curve? (y/n): ").strip().lower() == 'y'
+            has_npsh = input(
+                f"\n  Does this variant ({variant_label}) have an NPSH curve? (y/n): ").strip().lower() == 'y'
             if has_npsh:
-                print(f"  Now digitize the NPSH curve for diameter {diam} mm.")
+                print(f"  Now digitize the NPSH curve for {variant_label}.")
                 print("  Click points, press 'c' when done.")
 
                 npsh_curve = NPSHCurve(
                     name=f"NPSH_{curve_idx + 1}",
                     pump_number=curve_idx + 1,
-                    diameter=diam,
+                    variant_type=variant_type,
+                    variant_value=variant_value,
                     color=self.colors['npsh']
                 )
                 self.npsh_curves.append(npsh_curve)
@@ -576,23 +678,30 @@ class PumpCurveDigitizer:
                 points_npsh = []
 
                 def mouse_callback_npsh(event, x, y, flags, param):
-                    """Mouse callback for NPSH curve."""
+                    self.last_mouse_x, self.last_mouse_y = x, y
+
                     if event == cv2.EVENT_LBUTTONDOWN:
                         points_npsh.append((x, y))
-                        img_disp = self.image.copy()
-                        for (px, py) in points_npsh:
-                            cv2.circle(img_disp, (px, py), 4, self.colors['npsh'], -1)
-                        if len(points_npsh) > 1:
-                            pts = np.array(points_npsh, np.int32)
-                            cv2.polylines(img_disp, [pts], False, self.colors['npsh'], 2)
-                        cv2.putText(img_disp, f"Diameter {diam} mm - NPSH", (10, 30),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['npsh'], 2)
-                        cv2.imshow(self.window_name, img_disp)
+
+                    img_disp = self.image.copy()
+                    for (px, py) in points_npsh:
+                        cv2.circle(img_disp, (px, py), 4, self.colors['npsh'], -1)
+                    if len(points_npsh) > 1:
+                        pts = np.array(points_npsh, np.int32)
+                        cv2.polylines(img_disp, [pts], False, self.colors['npsh'], 2)
+
+                    cv2.putText(img_disp, f"{variant_label} - NPSH", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['npsh'], 2)
+
+                    if 0 <= x < self.image.shape[1] and 0 <= y < self.image.shape[0]:
+                        self.draw_zoom_panel(img_disp, x, y)
+
+                    cv2.imshow(self.window_name, img_disp)
 
                 cv2.setMouseCallback(self.window_name, mouse_callback_npsh)
 
                 img_disp = self.image.copy()
-                cv2.putText(img_disp, f"Diameter {diam} mm - NPSH", (10, 30),
+                cv2.putText(img_disp, f"{variant_label} - NPSH", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['npsh'], 2)
                 cv2.putText(img_disp, "Click points, press 'c' when done", (10, 60),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
@@ -607,7 +716,7 @@ class PumpCurveDigitizer:
                     npsh_curve.add_point(x, y)
 
             # --- Optionally digitize efficiency points ---
-            has_eff = input(f"\n  Are there efficiency points for diameter {diam} mm? (y/n): ").strip().lower() == 'y'
+            has_eff = input(f"\n  Are there efficiency points for {variant_label}? (y/n): ").strip().lower() == 'y'
             if has_eff:
                 print(f"  Now click on the Q-H curve at points where efficiency is known.")
                 print("  For each click, enter the efficiency value.")
@@ -615,30 +724,50 @@ class PumpCurveDigitizer:
                 points_eff = []
 
                 def mouse_callback_eff(event, x, y, flags, param):
-                    """Mouse callback for efficiency points (click on Q-H curve)."""
+                    """
+                    Mouse callback for digitizing efficiency points.
+                    Click on the Q-H curve at positions where efficiency is known.
+                    For each click, prompts the user to enter the efficiency value.
+                    """
+                    self.last_mouse_x, self.last_mouse_y = x, y
+
                     if event == cv2.EVENT_LBUTTONDOWN:
                         val = input(f"    Efficiency at this point (%): ").strip()
                         try:
                             eff_val = float(val)
                             points_eff.append((x, y, eff_val))
-                            # Update display
-                            img_disp = self.image.copy()
-                            # Show Q-H curve in background
-                            for pt in pump_curve.points:
-                                cv2.circle(img_disp, (pt.x_px, pt.y_px), 4, self.colors['pump'], -1)
-                            if len(pump_curve.points) > 1:
-                                pts = np.array([[p.x_px, p.y_px] for p in pump_curve.points], np.int32)
-                                cv2.polylines(img_disp, [pts], False, self.colors['pump'], 2)
-                            # Show efficiency points
-                            for (px, py, ev) in points_eff:
-                                cv2.circle(img_disp, (px, py), 6, self.colors['efficiency'], 2)
-                                cv2.putText(img_disp, f"{ev}%", (px + 10, py - 10),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.colors['efficiency'], 1)
-                            cv2.putText(img_disp, f"Diameter {diam} mm - Efficiency points", (10, 30),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['efficiency'], 2)
-                            cv2.imshow(self.window_name, img_disp)
                         except ValueError:
                             print("    Invalid number, skipping.")
+
+                    # Update display
+                    img_disp = self.image.copy()
+
+                    # Show Q-H curve in background for reference
+                    for pt in pump_curve.points:
+                        cv2.circle(img_disp, (pt.x_px, pt.y_px), 4, self.colors['pump'], -1)
+                    if len(pump_curve.points) > 1:
+                        pts = np.array([[p.x_px, p.y_px] for p in pump_curve.points], np.int32)
+                        cv2.polylines(img_disp, [pts], False, self.colors['pump'], 2)
+
+                    # Show efficiency points already collected
+                    for (px, py, ev) in points_eff:
+                        cv2.circle(img_disp, (px, py), 6, self.colors['efficiency'], 2)
+                        cv2.putText(img_disp, f"{ev}%", (px + 10, py - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.colors['efficiency'], 1)
+
+                    # Instructions
+                    cv2.putText(img_disp, f"{variant_label} - Click on Q-H curve for efficiency", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.colors['efficiency'], 2)
+                    cv2.putText(img_disp, f"Points: {len(points_eff)}", (10, 60),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                    cv2.putText(img_disp, "Press 'c' when done", (10, 85),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+                    # Draw zoom panel if mouse is inside image
+                    if 0 <= x < self.image.shape[1] and 0 <= y < self.image.shape[0]:
+                        self.draw_zoom_panel(img_disp, x, y)
+
+                    cv2.imshow(self.window_name, img_disp)
 
                 cv2.setMouseCallback(self.window_name, mouse_callback_eff)
 
@@ -649,7 +778,7 @@ class PumpCurveDigitizer:
                 if len(pump_curve.points) > 1:
                     pts = np.array([[p.x_px, p.y_px] for p in pump_curve.points], np.int32)
                     cv2.polylines(img_disp, [pts], False, self.colors['pump'], 2)
-                cv2.putText(img_disp, f"Diameter {diam} mm - Click on Q-H curve for efficiency", (10, 30),
+                cv2.putText(img_disp, f"{variant_label} - Click on Q-H curve for efficiency", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.colors['efficiency'], 2)
                 cv2.putText(img_disp, "Press 'c' when done", (10, 60),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
@@ -666,14 +795,15 @@ class PumpCurveDigitizer:
                         EfficiencyPoint(
                             pump_curve_name=pump_curve.name,
                             pump_number=curve_idx + 1,
-                            diameter=diam,
+                            variant_type=variant_type,
+                            variant_value=variant_value,
                             x_px=x,
                             y_px=y,
                             efficiency_value=val
                         )
                     )
 
-            # Reset mouse callback after finishing this diameter
+            # Reset mouse callback after finishing this variant
             cv2.setMouseCallback(self.window_name, lambda *args: None)
 
         cv2.destroyAllWindows()
@@ -717,31 +847,33 @@ class PumpCurveDigitizer:
 
     def fit_curves(self) -> List[FittedCurve]:
         """
-        Fit cubic polynomials to the digitized points for each impeller diameter.
-        Groups curves by diameter, fits Q-H and NPSH separately, and collects efficiency points.
+        Fit cubic polynomials to the digitized points for each variant (diameter or stages).
+        Groups curves by variant type and value, fits Q-H and NPSH separately, and collects efficiency points.
         Efficiency points are fitted with a 4th-degree polynomial.
         Returns a list of FittedCurve objects (one per curve).
         """
         print("\n📈 Fitting curves...")
         fitted_curves = []
 
-        # Group curves by diameter
-        curves_by_diam = {}
+        # Group curves by variant (type + value)
+        curves_by_variant = {}
         for pump in self.pump_curves:
-            curves_by_diam[pump.diameter] = {'pump': pump, 'npsh': None}
+            key = (pump.variant_type, pump.variant_value)
+            curves_by_variant[key] = {'pump': pump, 'npsh': None}
         for npsh in self.npsh_curves:
-            if npsh.diameter in curves_by_diam:
-                curves_by_diam[npsh.diameter]['npsh'] = npsh
+            key = (npsh.variant_type, npsh.variant_value)
+            if key in curves_by_variant:
+                curves_by_variant[key]['npsh'] = npsh
             else:
-                curves_by_diam[npsh.diameter] = {'pump': None, 'npsh': npsh}
+                curves_by_variant[key] = {'pump': None, 'npsh': npsh}
 
-        for diam, curves in curves_by_diam.items():
+        for (variant_type, variant_value), curves in curves_by_variant.items():
             pump_curve = curves['pump']
             npsh_curve = curves['npsh']
 
-            # --- Fit Q-H curve ---
+            # --- Fit Q-H curve (pump) ---
             if pump_curve and len(pump_curve.points) >= 4:
-                # ... (existing code to convert points, fit cubic) ...
+                # Convert points to real coordinates using head calibration
                 points_real = []
                 for p in pump_curve.points:
                     xr, yr = self.px_to_real(p.x_px, p.y_px, 'head')
@@ -750,6 +882,7 @@ class PumpCurveDigitizer:
                 x_real = np.array([p[0] for p in points_real])
                 y_real = np.array([p[1] for p in points_real])
 
+                # Fit cubic polynomial (degree 3)
                 coeffs = np.polyfit(x_real, y_real, 3)
                 poly = np.poly1d(coeffs)
                 y_fitted = poly(x_real)
@@ -759,10 +892,10 @@ class PumpCurveDigitizer:
                 y_span = y_range[1] - y_range[0]
                 confidence = 1.0 - min(1.0, rmse / (y_span if y_span > 0 else 1))
 
-                # Collect efficiency points for this diameter
+                # Collect efficiency points for this variant
                 eff_points = []
                 for ep in self.efficiency_points:
-                    if ep.diameter == diam:
+                    if ep.variant_type == variant_type and ep.variant_value == variant_value:
                         xr, _ = self.px_to_real(ep.x_px, ep.y_px, 'head')
                         eff_points.append((xr, ep.efficiency_value))
 
@@ -787,10 +920,16 @@ class PumpCurveDigitizer:
                         efficiency_x_min = float(x_eff[0])
                         efficiency_x_max = float(x_eff[-1])
                     except Exception as e:
-                        print(f"  ⚠️ Could not fit efficiency for d={diam}: {e}")
+                        print(f"  ⚠️ Could not fit efficiency for {variant_type}={variant_value}: {e}")
+
+                # Create name based on variant
+                if variant_type == "diameter":
+                    curve_name = f"Pump_d{variant_value}"
+                else:
+                    curve_name = f"Pump_stages{variant_value}"
 
                 fitted = FittedCurve(
-                    name=f"Pump_d{diam}",
+                    name=curve_name,
                     curve_type='pump',
                     points_px=[(p.x_px, p.y_px) for p in pump_curve.points],
                     points_real=points_real,
@@ -799,6 +938,8 @@ class PumpCurveDigitizer:
                     y_range=y_range,
                     rmse=float(rmse),
                     confidence=float(confidence),
+                    variant_type=variant_type,
+                    variant_value=variant_value,
                     efficiency_points=eff_points,
                     efficiency_coefficients=efficiency_coeffs,
                     efficiency_rmse=efficiency_rmse,
@@ -806,7 +947,8 @@ class PumpCurveDigitizer:
                     efficiency_x_max=efficiency_x_max
                 )
                 fitted_curves.append(fitted)
-                print(f"  ✅ Pump d={diam}: RMSE={rmse:.4f}, Confidence={confidence:.2f}, Eff points: {len(eff_points)}")
+                print(
+                    f"  ✅ Pump {variant_type}={variant_value}: RMSE={rmse:.4f}, Confidence={confidence:.2f}, Eff points: {len(eff_points)}")
                 if efficiency_coeffs:
                     print(
                         f"      Efficiency fitted, RMSE={efficiency_rmse:.4f}, range [{efficiency_x_min:.2f}, {efficiency_x_max:.2f}]")
@@ -830,8 +972,14 @@ class PumpCurveDigitizer:
                 y_span = y_range[1] - y_range[0]
                 confidence = 1.0 - min(1.0, rmse / (y_span if y_span > 0 else 1))
 
+                # Create name based on variant
+                if variant_type == "diameter":
+                    curve_name = f"NPSH_d{variant_value}"
+                else:
+                    curve_name = f"NPSH_stages{variant_value}"
+
                 fitted = FittedCurve(
-                    name=f"NPSH_d{diam}",
+                    name=curve_name,
                     curve_type='npsh',
                     points_px=[(p.x_px, p.y_px) for p in npsh_curve.points],
                     points_real=points_real,
@@ -839,10 +987,12 @@ class PumpCurveDigitizer:
                     x_range=(float(x_min), float(x_max)),
                     y_range=y_range,
                     rmse=float(rmse),
-                    confidence=float(confidence)
+                    confidence=float(confidence),
+                    variant_type=variant_type,
+                    variant_value=variant_value
                 )
                 fitted_curves.append(fitted)
-                print(f"  ✅ NPSH d={diam}: RMSE={rmse:.4f}, Confidence={confidence:.2f}")
+                print(f"  ✅ NPSH {variant_type}={variant_value}: RMSE={rmse:.4f}, Confidence={confidence:.2f}")
 
         return fitted_curves
 
@@ -930,26 +1080,30 @@ def {curve.name.lower().replace('-', '_').replace(' ', '_')}(x):
         """
         Export the digitized pump data to a JSON file, appending to existing catalog.
         Merges new data with existing entries: if same pump model AND same rpm exist,
-        adds only new impeller diameters.
+        adds only new variants (diameter or stages).
+
         Structure:
         {
             "pumps": [
                 {
                     "model": "...",
                     "rpm": 2980,
-                    "trim_allowed": true/false,
+                    "type": "single" or "multi",
+                    "trim_allowed": true/false (only for single-stage),
                     "impeller_options": [
                         {
-                            "diameter": 210,
+                            "variant": {"type": "diameter", "value": 210},  # universal
+                            "diameter": 210,                                 # for backward compatibility
+                            "stages": null,
                             "curves": {
                                 "q_h": {"coefficients": [...], "q_min": ..., "q_max": ...},
                                 "npsh": {...}   (optional)
                             },
-                            "efficiency": {
+                            "efficiency": {                                 # optional
                                 "coefficients": [...],
                                 "rmse": ...,
-                                "q_min": ...,   # from efficiency points
-                                "q_max": ...    # from efficiency points
+                                "q_min": ...,
+                                "q_max": ...
                             }
                         },
                         ...
@@ -958,34 +1112,49 @@ def {curve.name.lower().replace('-', '_').replace(' ', '_')}(x):
             ]
         }
         """
+        import re
+        import json
+        import os
 
-        # Group fitted curves by diameter
-        diam_dict = {}
+        # Group fitted curves by variant (type + value)
+        variant_dict = {}
         for curve in fitted_curves:
-            # Extract diameter from curve name (e.g., "Pump_d210" or "NPSH_d210")
-            match = re.search(r'_d(\d+)', curve.name)
-            if not match:
+            # Extract variant from curve name or directly from curve attributes
+            if not hasattr(curve, 'variant_type') or not hasattr(curve, 'variant_value'):
                 continue
-            diam = float(match.group(1))
-            if diam not in diam_dict:
-                diam_dict[diam] = {'pump': None, 'npsh': None}
+            vt = curve.variant_type
+            vv = curve.variant_value
+            key = (vt, vv)
+            if key not in variant_dict:
+                variant_dict[key] = {'pump': None, 'npsh': None}
             if curve.curve_type == 'pump':
-                diam_dict[diam]['pump'] = curve
+                variant_dict[key]['pump'] = curve
             elif curve.curve_type == 'npsh':
-                diam_dict[diam]['npsh'] = curve
+                variant_dict[key]['npsh'] = curve
 
         # Build new impeller options list
         new_impeller_options = []
-        for diam, curves in diam_dict.items():
+        for (vt, vv), curves in variant_dict.items():
             pump_curve = curves['pump']
             npsh_curve = curves['npsh']
             if pump_curve is None:
                 continue  # should not happen
 
             option = {
-                'diameter': diam,
+                'variant': {
+                    'type': vt,
+                    'value': vv
+                },
                 'curves': {}
             }
+
+            # Add direct field for backward compatibility
+            if vt == "diameter":
+                option['diameter'] = vv
+                option['stages'] = None
+            else:  # stages
+                option['stages'] = vv
+                option['diameter'] = None
 
             # Q-H curve
             option['curves']['q_h'] = {
@@ -999,7 +1168,6 @@ def {curve.name.lower().replace('-', '_').replace(' ', '_')}(x):
                 option['efficiency'] = {
                     'coefficients': pump_curve.efficiency_coefficients,
                     'rmse': pump_curve.efficiency_rmse,
-                    # Use the efficiency-specific x‑range (from user‑clicked points)
                     'q_min': pump_curve.efficiency_x_min,
                     'q_max': pump_curve.efficiency_x_max
                 }
@@ -1014,13 +1182,17 @@ def {curve.name.lower().replace('-', '_').replace(' ', '_')}(x):
 
             new_impeller_options.append(option)
 
-        # New pump entry (includes rpm)
+        # New pump entry
         new_pump = {
             'model': self.pump_model,
             'rpm': self.rpm,
-            'trim_allowed': self.trim_allowed,
+            'type': self.pump_type,  # "single" or "multi"
             'impeller_options': new_impeller_options
         }
+
+        # For single-stage pumps, include trim_allowed field
+        if self.pump_type == "single":
+            new_pump['trim_allowed'] = self.trim_allowed
 
         # Read existing catalog if it exists
         if os.path.exists(filename):
@@ -1046,19 +1218,27 @@ def {curve.name.lower().replace('-', '_').replace(' ', '_')}(x):
             catalog['pumps'].append(new_pump)
             print(f"✅ New pump entry added: '{self.pump_model}' at {self.rpm} rpm.")
         else:
-            # Merge impeller options: add diameters not already present
-            existing_diams = {opt['diameter'] for opt in existing_pump['impeller_options']}
+            # Merge impeller options: add variants not already present
+            # Determine which field to use as unique identifier based on pump type
+            if self.pump_type == "single":
+                existing_values = {opt.get('diameter') for opt in existing_pump['impeller_options'] if
+                                   opt.get('diameter') is not None}
+            else:
+                existing_values = {opt.get('stages') for opt in existing_pump['impeller_options'] if
+                                   opt.get('stages') is not None}
+
             added_count = 0
             for new_opt in new_impeller_options:
-                if new_opt['diameter'] not in existing_diams:
+                new_val = new_opt.get('diameter') if self.pump_type == "single" else new_opt.get('stages')
+                if new_val not in existing_values:
                     existing_pump['impeller_options'].append(new_opt)
                     added_count += 1
+
             if added_count > 0:
-                print(
-                    f"✅ Added {added_count} new impeller diameter(s) to existing pump '{self.pump_model}' at {self.rpm} rpm.")
+                print(f"✅ Added {added_count} new variant(s) to existing pump '{self.pump_model}' at {self.rpm} rpm.")
             else:
                 print(
-                    f"ℹ️ All impeller diameters already exist for pump '{self.pump_model}' at {self.rpm} rpm – no changes made.")
+                    f"ℹ️ All variants already exist for pump '{self.pump_model}' at {self.rpm} rpm – no changes made.")
 
         # Write back
         with open(filename, 'w') as f:
@@ -1076,6 +1256,12 @@ def {curve.name.lower().replace('-', '_').replace(' ', '_')}(x):
         colors = {'pump': 'blue', 'npsh': 'red'}
 
         for curve in fitted_curves:
+            # Create variant label for legend
+            if curve.variant_type == "diameter":
+                variant_str = f"{curve.variant_value}mm"
+            else:
+                variant_str = f"{curve.variant_value} stages"
+
             if curve.curve_type == 'pump':
                 # Original Q-H points
                 x_orig = [p[0] for p in curve.points_real]
@@ -1088,9 +1274,9 @@ def {curve.name.lower().replace('-', '_').replace(' ', '_')}(x):
 
                 # Plot Q-H
                 plt.scatter(x_orig, y_orig, c=colors['pump'], s=20, alpha=0.5, marker='o',
-                            label=f"{curve.name} (Q-H points)")
+                            label=f"{curve.name} ({variant_str}) Q-H points")
                 plt.plot(x_fit_qh, y_fit_qh, color=colors['pump'], linewidth=2,
-                         label=f"{curve.name} (Q-H fit)")
+                         label=f"{curve.name} ({variant_str}) Q-H fit")
 
                 # If efficiency coefficients exist, plot efficiency curve over its own valid range
                 if curve.efficiency_coefficients:
@@ -1101,7 +1287,6 @@ def {curve.name.lower().replace('-', '_').replace(' ', '_')}(x):
                         x_min_eff = curve.efficiency_x_min
                         x_max_eff = curve.efficiency_x_max
                     else:
-                        # Fallback (should not happen, but just in case)
                         x_min_eff = curve.x_range[0]
                         x_max_eff = curve.x_range[1]
 
@@ -1109,14 +1294,14 @@ def {curve.name.lower().replace('-', '_').replace(' ', '_')}(x):
                     y_fit_eff = poly_eff(x_fit_eff)
 
                     plt.plot(x_fit_eff, y_fit_eff, color='orange', linestyle='--', linewidth=2,
-                             label=f"{curve.name} Efficiency (fit)")
+                             label=f"{curve.name} ({variant_str}) Efficiency fit")
 
                     # Plot original efficiency points (if any)
                     if curve.efficiency_points:
                         x_eff = [p[0] for p in curve.efficiency_points]
                         y_eff = [p[1] for p in curve.efficiency_points]
                         plt.scatter(x_eff, y_eff, c='orange', s=40, marker='s', alpha=0.7,
-                                    label=f"{curve.name} Efficiency points")
+                                    label=f"{curve.name} ({variant_str}) Efficiency points")
 
             elif curve.curve_type == 'npsh':
                 # Original NPSH points
@@ -1129,9 +1314,9 @@ def {curve.name.lower().replace('-', '_').replace(' ', '_')}(x):
                 y_fit = poly(x_fit)
 
                 plt.scatter(x_orig, y_orig, c=colors['npsh'], s=20, alpha=0.5, marker='^',
-                            label=f"{curve.name} (points)")
+                            label=f"{curve.name} ({variant_str}) NPSH points")
                 plt.plot(x_fit, y_fit, color=colors['npsh'], linewidth=2,
-                         label=f"{curve.name} (fit)")
+                         label=f"{curve.name} ({variant_str}) NPSH fit")
 
         plt.xlabel('Flow Rate')
         plt.ylabel('Head / NPSH')

@@ -89,42 +89,35 @@ Output Format (JSON)
 The JSON catalog has the following structure:
 
 json
-{
-  "pumps": [
+Structure:
     {
-      "model": "NSC125-80-210",
-      "rpm": 2980,
-      "trim_allowed": true,
-      "impeller_options": [
-        {
-          "diameter": 210,
-          "curves": {
-            "q_h": {
-              "coefficients": [a3, a2, a1, a0],
-              "q_min": 10.0,
-              "q_max": 45.0
-            },
-            "npsh": {
-              "coefficients": [b3, b2, b1, b0],
-              "q_min": 10.0,
-              "q_max": 45.0
+        "pumps": [
+            {
+                "model": "...",
+                "rpm": 2980,
+                "type": "single" or "multi",
+                "trim_allowed": true/false (only for single-stage),
+                "impeller_options": [
+                    {
+                        "variant": {"type": "diameter", "value": 210},  # universal
+                        "diameter": 210,                                 # for backward compatibility
+                        "stages": null,
+                        "curves": {
+                            "q_h": {"coefficients": [...], "q_min": ..., "q_max": ...},
+                            "npsh": {...}   (optional)
+                        },
+                        "efficiency": {                                 # optional
+                            "coefficients": [...],
+                            "rmse": ...,
+                            "q_min": ...,
+                            "q_max": ...
+                        }
+                    },
+                    ...
+                ]
             }
-          },
-          "efficiency": {
-            "coefficients": [c4, c3, c2, c1, c0],
-            "rmse": 0.5,
-            "q_min": 15.0,
-            "q_max": 40.0
-          }
-        },
-        {
-          "diameter": 190,
-          ...
-        }
-      ]
+        ]
     }
-  ]
-}
 Example
 After processing a PDF page with curves for a pump at 2980 rpm and diameters 210 and 190 mm, you'll get a JSON file containing both impeller options under the same pump entry.
 
