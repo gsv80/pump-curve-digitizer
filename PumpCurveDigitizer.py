@@ -173,14 +173,13 @@ class PumpCurveDigitizer:
     """
 
     def __init__(self):
+        """
+        Initialize the digitizer with default values.
+        """
         self.image = None
         self.original_image = None
         self.graph_rect = None
         self.calibration = None
-
-        # For zoom feature: store last mouse coordinates to display magnified panel
-        self.last_mouse_x = -1
-        self.last_mouse_y = -1
 
         # Curves data
         self.pump_curves: List[PumpCurve] = []
@@ -200,46 +199,105 @@ class PumpCurveDigitizer:
             'npsh': (0, 0, 255),  # Red
             'calibration': (255, 0, 255),  # Magenta
             'selected': (255, 255, 0),  # Cyan
-            'efficiency': (255, 165, 0)  # Orange for efficiency points (on pump curve)
+            'efficiency': (255, 165, 0)  # Orange
         }
 
-        # Pump metadata: model name, rated speed (rpm), trim allowance, list of impeller options, and current working diameter
+        # Pump metadata
         self.pump_model: str = ""
-        self.rpm: int = 0  # Rated speed in revolutions per minute
+        self.rpm: int = 0
+        self.pump_type: str = "single"
         self.trim_allowed: bool = False
         self.impeller_options: List[Dict] = []
         self.current_diameter: float = 0.0
-        # Pump type: "single" for single-stage with impeller trimming, "multi" for multi-stage
-        self.pump_type: str = "single"
+        self.current_variant_type: str = "diameter"
+        self.current_variant_value: float = 0.0
 
-    def reset_for_new_page(self):
-        """
-        Reset all curve data to prepare for processing a new page.
-        Keeps calibration and pump metadata, but clears digitized curves.
-        """
-        self.pump_curves.clear()
-        self.npsh_curves.clear()
-        self.efficiency_points.clear()
-        self.impeller_options = []
-        self.current_diameter = 0.0
-        # Note: pump_model, rpm, trim_allowed are kept as they might be the same,
-        # but they will be overwritten by get_pump_info() on the next page.
+        # For zoom feature: store last mouse coordinates
+        self.last_mouse_x = -1
+        self.last_mouse_y = -1
 
-    def load_pdf_page(self, pdf_path: str, page_num: int = 1, dpi: int = 300):
-        """Load a PDF page as image."""
-        print(f"📄 Loading page {page_num} from {pdf_path}")
+        # Scaling support
+        self.original_width = 0
+        self.original_height = 0
+        self.scale_factor = 1.0
+
+    def _to_original_coords(self, x: int, y: int) -> Tuple[int, int]:
+        """
+        Convert scaled display coordinates to original image coordinates.
+
+        Args:
+            x, y: Coordinates on the scaled display image
+
+        Returns:
+            Corresponding coordinates on the original full-size image
+        """
+        if self.scale_factor == 1.0:
+            return x, y
+        return int(x / self.scale_factor), int(y / self.scale_factor)
+
+    def _to_display_coords(self, x: int, y: int) -> Tuple[int, int]:
+        """
+        Convert original image coordinates to scaled display coordinates.
+
+        Args:
+            x, y: Coordinates on the original full-size image
+
+        Returns:
+            Corresponding coordinates on the scaled display image
+        """
+        if self.scale_factor == 1.0:
+            return x, y
+        return int(x * self.scale_factor), int(y * self.scale_factor)
+
+    def load_pdf_page(self, pdf_path: str, page_num: int = 1, dpi: int = 300, scale_factor: float = 1.0):
+        """
+        Load a PDF page as image with optional scaling.
+
+        Args:
+            pdf_path: Path to PDF file
+            page_num: Page number to load (1-based)
+            dpi: Resolution for PDF conversion (higher = better quality but larger image)
+            scale_factor: Scaling factor for display (e.g., 0.5 = half size, 1.0 = original)
+                         Use this to fit large images on screen.
+        """
+        print(f"📄 Loading page {page_num} from {pdf_path} at {dpi} DPI")
         images = convert_from_path(pdf_path, dpi=dpi, first_page=page_num, last_page=page_num)
         self.original_image = np.array(images[0])
         self.original_image = cv2.cvtColor(self.original_image, cv2.COLOR_RGB2BGR)
-        self.image = self.original_image.copy()
-        print(f"✅ Image loaded: {self.image.shape[1]}x{self.image.shape[0]}")
+
+        # Store original dimensions
+        self.original_height, self.original_width = self.original_image.shape[:2]
+
+        # Apply scaling if needed
+        if scale_factor != 1.0:
+            new_width = int(self.original_width * scale_factor)
+            new_height = int(self.original_height * scale_factor)
+            self.image = cv2.resize(self.original_image, (new_width, new_height),
+                                    interpolation=cv2.INTER_AREA)
+            print(f"📏 Scaled image: {new_width}x{new_height} (factor: {scale_factor})")
+        else:
+            self.image = self.original_image.copy()
+            print(f"📏 Image size: {self.original_width}x{self.original_height}")
+
+        # Store scale factor for coordinate transformations
+        self.scale_factor = scale_factor
 
     def select_graph_area(self):
-        """Step 1: Select the graph area."""
+        """Step 1: Select the graph area on the scaled image."""
         print("\n📏 STEP 1: Select Graph Area")
         print("Drag and select the rectangle containing the graph")
         print("Press ENTER when done, ESC to cancel")
 
+        # Create a resizable window and set a reasonable initial size
+        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+        h, w = self.image.shape[:2]
+        win_w = min(1200, w)
+        win_h = min(800, h)
+        cv2.resizeWindow(self.window_name, win_w, win_h)
+        # Move window to a visible position (top-left corner with offset)
+        cv2.moveWindow(self.window_name, 50, 50)
+
+        # Show the ROI selector
         roi = cv2.selectROI(self.window_name, self.image, False)
         cv2.destroyWindow(self.window_name)
 
@@ -248,11 +306,21 @@ class PumpCurveDigitizer:
             return False
 
         x, y, w, h = [int(v) for v in roi]
-        self.graph_rect = (x, y, w, h)
 
-        # Crop image to graph area for further work
-        self.image = self.image[y:y + h, x:x + w]
-        print(f"✅ Graph area selected: ({x}, {y}, {w}, {h})")
+        # Convert ROI coordinates to original image coordinates
+        orig_x, orig_y = self._to_original_coords(x, y)
+        orig_w = int(w / self.scale_factor) if self.scale_factor != 0 else w
+        orig_h = int(h / self.scale_factor) if self.scale_factor != 0 else h
+
+        self.graph_rect = (orig_x, orig_y, orig_w, orig_h)
+
+        # Crop the original image to graph area
+        self.image = self.original_image[orig_y:orig_y + orig_h, orig_x:orig_x + orig_w].copy()
+
+        # Reset scale factor because we are now working with the original‑size cropped area
+        self.scale_factor = 1.0
+
+        print(f"✅ Graph area selected: ({orig_x}, {orig_y}, {orig_w}, {orig_h})")
         return True
 
     def draw_zoom_panel(self, img: np.ndarray, mouse_x: int, mouse_y: int,
@@ -298,8 +366,8 @@ class PumpCurveDigitizer:
         # Draw a white border and a small crosshair in the center of the zoomed panel
         cv2.rectangle(zoomed, (0, 0), (panel_size - 1, panel_size - 1), (255, 255, 255), 1)
         cx, cy = panel_size // 2, panel_size // 2
-        cv2.line(zoomed, (cx - 5, cy), (cx + 5, cy), (0, 255, 0), 1)
-        cv2.line(zoomed, (cx, cy - 5), (cx, cy + 5), (0, 255, 0), 1)
+        cv2.line(zoomed, (cx - 15, cy), (cx + 15, cy), (0, 0, 255), 1)
+        cv2.line(zoomed, (cx, cy - 15), (cx, cy + 15), (0, 0, 255), 1)
 
         # Paste the zoom panel into the top-right corner of the original image
         img[10:10 + panel_size, w - panel_size - 10:w - 10] = zoomed
@@ -346,8 +414,11 @@ class PumpCurveDigitizer:
 
         def mouse_callback(event, x, y, flags, param):
             nonlocal skip_npsh, skip_eff
-            # Store mouse position for zoom panel
+            # Store mouse position for zoom panel (display coordinates)
             self.last_mouse_x, self.last_mouse_y = x, y
+
+            # Convert to original coordinates for storing calibration points
+            orig_x, orig_y = self._to_original_coords(x, y)
 
             if event == cv2.EVENT_LBUTTONDOWN:
                 idx = len(calib_points)
@@ -357,8 +428,8 @@ class PumpCurveDigitizer:
                 desc = expected_points[idx][1]
                 print(f"\nPoint {idx + 1}: {desc}")
 
-                # Draw point (will be redrawn in the updated display)
-                calib_points.append((x, y, expected_points[idx][0]))
+                # Store original coordinates
+                calib_points.append((orig_x, orig_y, expected_points[idx][0]))
 
                 # Ask for value (same as before)
                 if "first point" in desc and ("NPSH" in desc or "efficiency" in desc):
@@ -369,7 +440,6 @@ class PumpCurveDigitizer:
                         elif "efficiency" in desc:
                             skip_eff = True
                         print(f"  Skipping {desc.split()[0]} axis.")
-                        # Remove the last point if skipped
                         calib_points.pop()
                         return
                     else:
@@ -379,14 +449,15 @@ class PumpCurveDigitizer:
 
                 values.append(value)
 
-            # Always update display to show zoom and already clicked points
+            # Update display with converted coordinates
             img_disp = self.image.copy()
             for i, (px, py, label) in enumerate(calib_points):
-                cv2.circle(img_disp, (px, py), 5, self.colors['calibration'], -1)
-                cv2.putText(img_disp, str(i + 1), (px + 10, py - 10),
+                disp_x, disp_y = self._to_display_coords(px, py)
+                cv2.circle(img_disp, (disp_x, disp_y), 5, self.colors['calibration'], -1)
+                cv2.putText(img_disp, str(i + 1), (disp_x + 10, disp_y - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['calibration'], 2)
 
-            # If mouse is inside the image, draw zoom panel
+            # If mouse is inside the image, draw zoom panel (using display coordinates)
             if 0 <= x < self.image.shape[1] and 0 <= y < self.image.shape[0]:
                 self.draw_zoom_panel(img_disp, x, y)
 
@@ -613,27 +684,38 @@ class PumpCurveDigitizer:
             points_temp = []  # temporary storage for points of this curve
 
             def mouse_callback_qh(event, x, y, flags, param):
-                # Store mouse position for zoom
+                # Store mouse position for zoom (using display coordinates)
                 self.last_mouse_x, self.last_mouse_y = x, y
 
-                if event == cv2.EVENT_LBUTTONDOWN:
-                    points_temp.append((x, y))
+                # Convert to original coordinates for storing points
+                orig_x, orig_y = self._to_original_coords(x, y)
 
-                # Update display
+                if event == cv2.EVENT_LBUTTONDOWN:
+                    points_temp.append((orig_x, orig_y))
+
+                # Update display - convert stored original points back to display coordinates
                 img_disp = self.image.copy()
                 for (px, py) in points_temp:
-                    cv2.circle(img_disp, (px, py), 4, self.colors['pump'], -1)
+                    disp_x, disp_y = self._to_display_coords(px, py)
+                    cv2.circle(img_disp, (disp_x, disp_y), 4, self.colors['pump'], -1)
+
                 if len(points_temp) > 1:
-                    pts = np.array(points_temp, np.int32)
+                    # Convert all points to display coordinates for polyline
+                    display_pts = []
+                    for (px, py) in points_temp:
+                        disp_x, disp_y = self._to_display_coords(px, py)
+                        display_pts.append([disp_x, disp_y])
+                    pts = np.array(display_pts, np.int32)
                     cv2.polylines(img_disp, [pts], False, self.colors['pump'], 2)
 
                 # Show variant label
+                variant_label = f"{self.current_variant_value}{'mm' if self.current_variant_type == 'diameter' else ' stages'}"
                 cv2.putText(img_disp, f"{variant_label} - Q-H", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['pump'], 2)
                 cv2.putText(img_disp, f"Points: {len(points_temp)}", (10, 60),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
-                # Draw zoom panel if mouse is inside image
+                # Draw zoom panel if mouse is inside image (using display coordinates)
                 if 0 <= x < self.image.shape[1] and 0 <= y < self.image.shape[0]:
                     self.draw_zoom_panel(img_disp, x, y)
 
@@ -678,21 +760,43 @@ class PumpCurveDigitizer:
                 points_npsh = []
 
                 def mouse_callback_npsh(event, x, y, flags, param):
+                    """
+                    Mouse callback for digitizing NPSH curve points.
+                    Uses nonlocal variables: points_npsh, npsh_curve, diam, variant_label.
+                    """
+                    # Store mouse position for zoom panel (display coordinates)
                     self.last_mouse_x, self.last_mouse_y = x, y
 
-                    if event == cv2.EVENT_LBUTTONDOWN:
-                        points_npsh.append((x, y))
+                    # Convert to original coordinates for storing
+                    orig_x, orig_y = self._to_original_coords(x, y)
 
+                    if event == cv2.EVENT_LBUTTONDOWN:
+                        points_npsh.append((orig_x, orig_y))
+
+                    # Update display: convert stored original points to display coordinates
                     img_disp = self.image.copy()
                     for (px, py) in points_npsh:
-                        cv2.circle(img_disp, (px, py), 4, self.colors['npsh'], -1)
+                        disp_x, disp_y = self._to_display_coords(px, py)
+                        cv2.circle(img_disp, (disp_x, disp_y), 4, self.colors['npsh'], -1)
+
                     if len(points_npsh) > 1:
-                        pts = np.array(points_npsh, np.int32)
+                        # Convert all points to display coordinates for polyline
+                        display_pts = []
+                        for (px, py) in points_npsh:
+                            disp_x, disp_y = self._to_display_coords(px, py)
+                            display_pts.append([disp_x, disp_y])
+                        pts = np.array(display_pts, np.int32)
                         cv2.polylines(img_disp, [pts], False, self.colors['npsh'], 2)
 
+                    # Show instructions
                     cv2.putText(img_disp, f"{variant_label} - NPSH", (10, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['npsh'], 2)
+                    cv2.putText(img_disp, f"Points: {len(points_npsh)}", (10, 60),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                    cv2.putText(img_disp, "Press 'c' when done", (10, 85),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
+                    # Draw zoom panel if mouse is inside image (display coordinates)
                     if 0 <= x < self.image.shape[1] and 0 <= y < self.image.shape[0]:
                         self.draw_zoom_panel(img_disp, x, y)
 
@@ -726,33 +830,45 @@ class PumpCurveDigitizer:
                 def mouse_callback_eff(event, x, y, flags, param):
                     """
                     Mouse callback for digitizing efficiency points.
-                    Click on the Q-H curve at positions where efficiency is known.
-                    For each click, prompts the user to enter the efficiency value.
+                    Clicks should be made on the Q-H curve; user is prompted to enter efficiency value.
+                    Uses nonlocal variables: points_eff, pump_curve, diam, variant_label.
                     """
+                    # Store mouse position for zoom panel (display coordinates)
                     self.last_mouse_x, self.last_mouse_y = x, y
+
+                    # Convert to original coordinates for storing
+                    orig_x, orig_y = self._to_original_coords(x, y)
 
                     if event == cv2.EVENT_LBUTTONDOWN:
                         val = input(f"    Efficiency at this point (%): ").strip()
                         try:
                             eff_val = float(val)
-                            points_eff.append((x, y, eff_val))
+                            points_eff.append((orig_x, orig_y, eff_val))
                         except ValueError:
                             print("    Invalid number, skipping.")
 
                     # Update display
                     img_disp = self.image.copy()
 
-                    # Show Q-H curve in background for reference
+                    # Show Q-H curve in background (using stored original points of pump_curve)
                     for pt in pump_curve.points:
-                        cv2.circle(img_disp, (pt.x_px, pt.y_px), 4, self.colors['pump'], -1)
+                        disp_x, disp_y = self._to_display_coords(pt.x_px, pt.y_px)
+                        cv2.circle(img_disp, (disp_x, disp_y), 4, self.colors['pump'], -1)
+
                     if len(pump_curve.points) > 1:
-                        pts = np.array([[p.x_px, p.y_px] for p in pump_curve.points], np.int32)
+                        # Convert all pump curve points to display coordinates for polyline
+                        display_pts = []
+                        for pt in pump_curve.points:
+                            disp_x, disp_y = self._to_display_coords(pt.x_px, pt.y_px)
+                            display_pts.append([disp_x, disp_y])
+                        pts = np.array(display_pts, np.int32)
                         cv2.polylines(img_disp, [pts], False, self.colors['pump'], 2)
 
                     # Show efficiency points already collected
                     for (px, py, ev) in points_eff:
-                        cv2.circle(img_disp, (px, py), 6, self.colors['efficiency'], 2)
-                        cv2.putText(img_disp, f"{ev}%", (px + 10, py - 10),
+                        disp_x, disp_y = self._to_display_coords(px, py)
+                        cv2.circle(img_disp, (disp_x, disp_y), 6, self.colors['efficiency'], 2)
+                        cv2.putText(img_disp, f"{ev}%", (disp_x + 10, disp_y - 10),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.colors['efficiency'], 1)
 
                     # Instructions
@@ -763,7 +879,7 @@ class PumpCurveDigitizer:
                     cv2.putText(img_disp, "Press 'c' when done", (10, 85),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
-                    # Draw zoom panel if mouse is inside image
+                    # Draw zoom panel if mouse is inside image (display coordinates)
                     if 0 <= x < self.image.shape[1] and 0 <= y < self.image.shape[0]:
                         self.draw_zoom_panel(img_disp, x, y)
 
@@ -844,6 +960,21 @@ class PumpCurveDigitizer:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
         cv2.imshow(self.window_name, img_disp)
+
+    def reset_for_new_page(self):
+        """
+        Reset all curve data to prepare for processing a new page.
+        Keeps calibration and pump metadata, but clears digitized curves.
+        """
+        self.pump_curves.clear()
+        self.npsh_curves.clear()
+        self.efficiency_points.clear()
+        self.impeller_options = []
+        self.current_diameter = 0.0
+        # Scale factor is reset when loading new page, but we'll clear it too
+        self.scale_factor = 1.0
+        # Note: pump_model, rpm, trim_allowed are kept as they might be the same,
+        # but they will be overwritten by get_pump_info() on the next page.
 
     def fit_curves(self) -> List[FittedCurve]:
         """
@@ -1245,6 +1376,7 @@ def {curve.name.lower().replace('-', '_').replace(' ', '_')}(x):
             json.dump(catalog, f, indent=2)
         print(f"✅ JSON catalog saved to {filename} (total pump entries: {len(catalog['pumps'])}")
 
+
     def plot_results(self, fitted_curves: List[FittedCurve]):
         """
         Plot original points and fitted curves.
@@ -1326,14 +1458,30 @@ def {curve.name.lower().replace('-', '_').replace(' ', '_')}(x):
         plt.tight_layout()
         plt.show()
 
-    def run(self, pdf_path: str):
+    def run(self, pdf_path: str, scale_factor: float = 0.8):
         """
-        Main execution pipeline with multi‑page support.
+        Main execution pipeline with multi‑page support and scaling.
         User can process multiple pages sequentially, each time adding data to the JSON catalog.
+
+        Args:
+            pdf_path: Path to PDF file
+            scale_factor: Scaling factor for display (0.8 = 80% of original size)
+                         Adjust this value if the image is too large for your screen.
         """
         print("\n" + "=" * 60)
         print("PROFESSIONAL PUMP CURVE DIGITIZER")
         print("=" * 60)
+
+        # Ask for scale factor interactively, with a hint
+        print("\nThe PDF page may be very large. You can scale it down to fit your screen.")
+        user_scale = input(f"Enter display scale factor (default {scale_factor}, e.g., 0.5 for half size): ").strip()
+        if user_scale:
+            try:
+                scale_factor = float(user_scale)
+            except ValueError:
+                print("⚠️ Invalid number, using default.")
+
+        print(f"Using scale factor: {scale_factor}")
 
         # Loop for processing multiple pages
         page_counter = 0
@@ -1352,15 +1500,15 @@ def {curve.name.lower().replace('-', '_').replace(' ', '_')}(x):
                 if current_page <= 0:
                     break
 
-            # Load the PDF page
-            self.load_pdf_page(pdf_path, page_num=current_page, dpi=300)
+            # Load the PDF page with scaling
+            self.load_pdf_page(pdf_path, page_num=current_page, dpi=300, scale_factor=scale_factor)
 
             # Step 2: Select graph area
             if not self.select_graph_area():
                 print("⚠️ Graph area selection failed. Skipping this page.")
                 continue
 
-            # Step 3: Calibrate axes (re‑calibrate each page – could be refined later)
+            # Step 3: Calibrate axes (re‑calibrate each page)
             if not self.calibrate_axes():
                 print("⚠️ Calibration failed. Skipping this page.")
                 continue
@@ -1388,9 +1536,9 @@ def {curve.name.lower().replace('-', '_').replace(' ', '_')}(x):
             choice = input("Enter 1, 2, or 3: ").strip()
 
             if choice in ['1', '3']:
-                self.export_results(fitted_curves)  # CSV export (overwrites files each time)
+                self.export_results(fitted_curves)
             if choice in ['2', '3']:
-                self.export_to_json(fitted_curves)  # Appends/merges into catalog
+                self.export_to_json(fitted_curves)
 
             # Step 8: Show plot (optional)
             show_plot = input("\nShow plot for this page? (y/n): ").strip().lower()
@@ -1402,9 +1550,8 @@ def {curve.name.lower().replace('-', '_').replace(' ', '_')}(x):
             if again != 'y':
                 break
 
-            # Reset for the next page (clear curves but keep nothing)
+            # Reset for the next page
             self.reset_for_new_page()
-            # The next loop iteration will load the new page and repeat
 
         print(f"\n✅ All done! Processed {page_counter} page(s).")
 
