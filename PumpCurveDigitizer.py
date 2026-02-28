@@ -221,6 +221,14 @@ class PumpCurveDigitizer:
         self.original_height = 0
         self.scale_factor = 1.0
 
+    def _confirm_step(self, step_name: str) -> bool:
+        """
+        Ask user to confirm the completed step.
+        Returns True if confirmed, False if wants to redo.
+        """
+        response = input(f"\n✅ {step_name} completed. Do you want to keep it? (y/n): ").strip().lower()
+        return response == 'y'
+
     def _to_original_coords(self, x: int, y: int) -> Tuple[int, int]:
         """
         Convert scaled display coordinates to original image coordinates.
@@ -375,188 +383,186 @@ class PumpCurveDigitizer:
         return img
 
     def calibrate_axes(self):
-        """Step 2: Calibrate all axes by clicking two points per axis."""
-        print("\n📐 STEP 2: Axis Calibration (Two points per axis)")
-        print("\nWe need to calibrate axes by clicking two known points for each.")
-        print("Order of clicks:")
-        print("1. X-axis: first point (left, known flow)")
-        print("2. X-axis: second point (right, known flow)")
-        print("3. Y-axis HEAD (left): first point (bottom, known head)")
-        print("4. Y-axis HEAD (left): second point (top, known head)")
-        print("5. Y-axis NPSH (right): first point (bottom, known NPSH) – press 's' to skip if not present")
-        print("6. Y-axis NPSH (right): second point (top, known NPSH)")
-        print("7. Y-axis EFFICIENCY (right): first point (bottom, known %) – press 's' to skip")
-        print("8. Y-axis EFFICIENCY (right): second point (top, known %)")
-        print("\nFor each point, you'll enter the real value.")
+        """
+        Step 2: Calibrate all axes by clicking two points per axis.
+        User can redo the whole calibration if not satisfied.
+        """
+        while True:  # Loop until user confirms
+            print("\n📐 STEP 2: Axis Calibration (Two points per axis)")
+            print("\nWe need to calibrate axes by clicking two known points for each.")
+            print("Order of clicks:")
+            print("1. X-axis: first point (left, known flow)")
+            print("2. X-axis: second point (right, known flow)")
+            print("3. Y-axis HEAD (left): first point (bottom, known head)")
+            print("4. Y-axis HEAD (left): second point (top, known head)")
+            print("5. Y-axis NPSH (right): first point (bottom, known NPSH) – press 's' to skip if not present")
+            print("6. Y-axis NPSH (right): second point (top, known NPSH)")
+            print("7. Y-axis EFFICIENCY (right): first point (bottom, known %) – press 's' to skip")
+            print("8. Y-axis EFFICIENCY (right): second point (top, known %)")
+            print("\nFor each point, you'll enter the real value.")
 
-        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(self.window_name, 1200, 800)
+            cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(self.window_name, 1200, 800)
 
-        # Store calibration points in order
-        calib_points = []  # list of (x_px, y_px, description)
-        values = []
+            calib_points = []  # list of (x_px, y_px, description)
+            values = []
+            expected_points = [
+                ("X1", "X-axis first point (left)"),
+                ("X2", "X-axis second point (right)"),
+                ("Y_HEAD1", "Y-head first point (bottom)"),
+                ("Y_HEAD2", "Y-head second point (top)"),
+                ("Y_NPSH1", "Y-NPSH first point (bottom)"),
+                ("Y_NPSH2", "Y-NPSH second point (top)"),
+                ("Y_EFF1", "Y-efficiency first point (bottom)"),
+                ("Y_EFF2", "Y-efficiency second point (top)")
+            ]
+            skip_npsh = False
+            skip_eff = False
 
-        # Expected sequence (some may be skipped)
-        expected_points = [
-            ("X1", "X-axis first point (left)"),
-            ("X2", "X-axis second point (right)"),
-            ("Y_HEAD1", "Y-head first point (bottom)"),
-            ("Y_HEAD2", "Y-head second point (top)"),
-            ("Y_NPSH1", "Y-NPSH first point (bottom)"),
-            ("Y_NPSH2", "Y-NPSH second point (top)"),
-            ("Y_EFF1", "Y-efficiency first point (bottom)"),
-            ("Y_EFF2", "Y-efficiency second point (top)")
-        ]
+            def mouse_callback(event, x, y, flags, param):
+                nonlocal skip_npsh, skip_eff
+                self.last_mouse_x, self.last_mouse_y = x, y
+                orig_x, orig_y = self._to_original_coords(x, y)
 
-        # Flags for skipped axes
-        skip_npsh = False
-        skip_eff = False
-
-        def mouse_callback(event, x, y, flags, param):
-            nonlocal skip_npsh, skip_eff
-            # Store mouse position for zoom panel (display coordinates)
-            self.last_mouse_x, self.last_mouse_y = x, y
-
-            # Convert to original coordinates for storing calibration points
-            orig_x, orig_y = self._to_original_coords(x, y)
-
-            if event == cv2.EVENT_LBUTTONDOWN:
-                idx = len(calib_points)
-                if idx >= len(expected_points):
-                    return
-
-                desc = expected_points[idx][1]
-                print(f"\nPoint {idx + 1}: {desc}")
-
-                # Store original coordinates
-                calib_points.append((orig_x, orig_y, expected_points[idx][0]))
-
-                # Ask for value (same as before)
-                if "first point" in desc and ("NPSH" in desc or "efficiency" in desc):
-                    choice = input(f"  Enter value for {desc} (or 's' to skip this axis): ").strip()
-                    if choice.lower() == 's':
-                        if "NPSH" in desc:
-                            skip_npsh = True
-                        elif "efficiency" in desc:
-                            skip_eff = True
-                        print(f"  Skipping {desc.split()[0]} axis.")
-                        calib_points.pop()
+                if event == cv2.EVENT_LBUTTONDOWN:
+                    idx = len(calib_points)
+                    if idx >= len(expected_points):
                         return
+
+                    desc = expected_points[idx][1]
+                    print(f"\nPoint {idx + 1}: {desc}")
+
+                    calib_points.append((orig_x, orig_y, expected_points[idx][0]))
+
+                    if "first point" in desc and ("NPSH" in desc or "efficiency" in desc):
+                        choice = input(f"  Enter value for {desc} (or 's' to skip this axis): ").strip()
+                        if choice.lower() == 's':
+                            if "NPSH" in desc:
+                                skip_npsh = True
+                            elif "efficiency" in desc:
+                                skip_eff = True
+                            print(f"  Skipping {desc.split()[0]} axis.")
+                            calib_points.pop()
+                            return
+                        else:
+                            value = float(choice)
                     else:
-                        value = float(choice)
-                else:
-                    value = float(input(f"  Enter real value: ").strip())
+                        value = float(input(f"  Enter real value: ").strip())
 
-                values.append(value)
+                    values.append(value)
 
-            # Update display with converted coordinates
+                # Update display
+                img_disp = self.image.copy()
+                for i, (px, py, label) in enumerate(calib_points):
+                    disp_x, disp_y = self._to_display_coords(px, py)
+                    cv2.circle(img_disp, (disp_x, disp_y), 5, self.colors['calibration'], -1)
+                    cv2.putText(img_disp, str(i + 1), (disp_x + 10, disp_y - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['calibration'], 2)
+
+                if 0 <= x < self.image.shape[1] and 0 <= y < self.image.shape[0]:
+                    self.draw_zoom_panel(img_disp, x, y)
+
+                cv2.imshow(self.window_name, img_disp)
+
+            cv2.setMouseCallback(self.window_name, mouse_callback)
+
+            # Show instructions on image
             img_disp = self.image.copy()
-            for i, (px, py, label) in enumerate(calib_points):
-                disp_x, disp_y = self._to_display_coords(px, py)
-                cv2.circle(img_disp, (disp_x, disp_y), 5, self.colors['calibration'], -1)
-                cv2.putText(img_disp, str(i + 1), (disp_x + 10, disp_y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['calibration'], 2)
-
-            # If mouse is inside the image, draw zoom panel (using display coordinates)
-            if 0 <= x < self.image.shape[1] and 0 <= y < self.image.shape[0]:
-                self.draw_zoom_panel(img_disp, x, y)
-
+            y_pos = 30
+            instructions = [
+                "Calibration: Click two points per axis",
+                "1. X-axis left",
+                "2. X-axis right",
+                "3. Y-head bottom",
+                "4. Y-head top",
+                "5. Y-NPSH bottom (s to skip)",
+                "6. Y-NPSH top",
+                "7. Y-efficiency bottom (s to skip)",
+                "8. Y-efficiency top"
+            ]
+            for text in instructions:
+                cv2.putText(img_disp, text, (10, y_pos),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.colors['calibration'], 1)
+                y_pos += 25
             cv2.imshow(self.window_name, img_disp)
 
-        cv2.setMouseCallback(self.window_name, mouse_callback)
+            print("\nClick on the points in order. Press 'c' when done (after all required points), ESC to cancel")
 
-        # Show instructions on image
-        img_disp = self.image.copy()
-        y_pos = 30
-        instructions = [
-            "Calibration: Click two points per axis",
-            "1. X-axis left",
-            "2. X-axis right",
-            "3. Y-head bottom",
-            "4. Y-head top",
-            "5. Y-NPSH bottom (s to skip)",
-            "6. Y-NPSH top",
-            "7. Y-efficiency bottom (s to skip)",
-            "8. Y-efficiency top"
-        ]
-        for text in instructions:
-            cv2.putText(img_disp, text, (10, y_pos),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.colors['calibration'], 1)
-            y_pos += 25
+            while True:
+                key = cv2.waitKey(100) & 0xFF
+                if key == 27:  # ESC
+                    cv2.destroyAllWindows()
+                    return False
+                elif key == ord('c'):
+                    if len(calib_points) >= 4:
+                        break
+                    else:
+                        print("⚠️ Need at least X and Y head points (4 points). Continue clicking.")
 
-        cv2.imshow(self.window_name, img_disp)
+            cv2.destroyAllWindows()
 
-        print("\nClick on the points in order. Press 'c' when done (after all required points), ESC to cancel")
-
-        while True:
-            key = cv2.waitKey(100) & 0xFF
-            if key == 27:  # ESC
-                cv2.destroyAllWindows()
+            # Build calibration object
+            # Create CalibrationPoint objects for each point
+            # Find indices for each label
+            x_p1 = next((p for p in calib_points if p[2] == "X1"), None)
+            x_p2 = next((p for p in calib_points if p[2] == "X2"), None)
+            if not x_p1 or not x_p2:
+                print("❌ Missing X-axis calibration points")
                 return False
-            elif key == ord('c'):
-                # Check we have at least X and Y head points (4 points)
-                if len(calib_points) >= 4:
-                    break
-                else:
-                    print("⚠️ Need at least X and Y head points (4 points). Continue clicking.")
 
-        cv2.destroyAllWindows()
+            x_points = (
+                CalibrationPoint(x_p1[0], x_p1[1], values[calib_points.index(x_p1)], "X1"),
+                CalibrationPoint(x_p2[0], x_p2[1], values[calib_points.index(x_p2)], "X2")
+            )
 
-        # Build calibration object
-        # X points
-        x_p1 = next((p for p in calib_points if p[2] == "X1"), None)
-        x_p2 = next((p for p in calib_points if p[2] == "X2"), None)
-        if not x_p1 or not x_p2:
-            print("❌ Missing X-axis calibration points")
-            return False
+            yh_p1 = next((p for p in calib_points if p[2] == "Y_HEAD1"), None)
+            yh_p2 = next((p for p in calib_points if p[2] == "Y_HEAD2"), None)
+            if not yh_p1 or not yh_p2:
+                print("❌ Missing Y-head calibration points")
+                return False
 
-        x_points = (
-            CalibrationPoint(x_p1[0], x_p1[1], values[calib_points.index(x_p1)], "X1"),
-            CalibrationPoint(x_p2[0], x_p2[1], values[calib_points.index(x_p2)], "X2")
-        )
+            y_head_points = (
+                CalibrationPoint(yh_p1[0], yh_p1[1], values[calib_points.index(yh_p1)], "Y_HEAD1"),
+                CalibrationPoint(yh_p2[0], yh_p2[1], values[calib_points.index(yh_p2)], "Y_HEAD2")
+            )
 
-        # Y head points
-        yh_p1 = next((p for p in calib_points if p[2] == "Y_HEAD1"), None)
-        yh_p2 = next((p for p in calib_points if p[2] == "Y_HEAD2"), None)
-        if not yh_p1 or not yh_p2:
-            print("❌ Missing Y-head calibration points")
-            return False
+            # NPSH points (optional)
+            y_npsh_points = None
+            if not skip_npsh:
+                yn_p1 = next((p for p in calib_points if p[2] == "Y_NPSH1"), None)
+                yn_p2 = next((p for p in calib_points if p[2] == "Y_NPSH2"), None)
+                if yn_p1 and yn_p2:
+                    y_npsh_points = (
+                        CalibrationPoint(yn_p1[0], yn_p1[1], values[calib_points.index(yn_p1)], "Y_NPSH1"),
+                        CalibrationPoint(yn_p2[0], yn_p2[1], values[calib_points.index(yn_p2)], "Y_NPSH2")
+                    )
 
-        y_head_points = (
-            CalibrationPoint(yh_p1[0], yh_p1[1], values[calib_points.index(yh_p1)], "Y_HEAD1"),
-            CalibrationPoint(yh_p2[0], yh_p2[1], values[calib_points.index(yh_p2)], "Y_HEAD2")
-        )
+            # Efficiency points (optional)
+            y_eff_points = None
+            if not skip_eff:
+                ye_p1 = next((p for p in calib_points if p[2] == "Y_EFF1"), None)
+                ye_p2 = next((p for p in calib_points if p[2] == "Y_EFF2"), None)
+                if ye_p1 and ye_p2:
+                    y_eff_points = (
+                        CalibrationPoint(ye_p1[0], ye_p1[1], values[calib_points.index(ye_p1)], "Y_EFF1"),
+                        CalibrationPoint(ye_p2[0], ye_p2[1], values[calib_points.index(ye_p2)], "Y_EFF2")
+                    )
 
-        # Y NPSH points (optional)
-        y_npsh_points = None
-        if not skip_npsh:
-            yn_p1 = next((p for p in calib_points if p[2] == "Y_NPSH1"), None)
-            yn_p2 = next((p for p in calib_points if p[2] == "Y_NPSH2"), None)
-            if yn_p1 and yn_p2:
-                y_npsh_points = (
-                    CalibrationPoint(yn_p1[0], yn_p1[1], values[calib_points.index(yn_p1)], "Y_NPSH1"),
-                    CalibrationPoint(yn_p2[0], yn_p2[1], values[calib_points.index(yn_p2)], "Y_NPSH2")
-                )
+            self.calibration = AxisCalibration(
+                x_points=x_points,
+                y_head_points=y_head_points,
+                y_npsh_points=y_npsh_points,
+                y_efficiency_points=y_eff_points
+            )
 
-        # Y efficiency points (optional)
-        y_eff_points = None
-        if not skip_eff:
-            ye_p1 = next((p for p in calib_points if p[2] == "Y_EFF1"), None)
-            ye_p2 = next((p for p in calib_points if p[2] == "Y_EFF2"), None)
-            if ye_p1 and ye_p2:
-                y_eff_points = (
-                    CalibrationPoint(ye_p1[0], ye_p1[1], values[calib_points.index(ye_p1)], "Y_EFF1"),
-                    CalibrationPoint(ye_p2[0], ye_p2[1], values[calib_points.index(ye_p2)], "Y_EFF2")
-                )
+            # Ask for confirmation
+            if not self._confirm_step("Axis calibration"):
+                print("🔄 Redoing calibration...")
+                continue
+            else:
+                print("✅ Calibration confirmed.")
+                break
 
-        self.calibration = AxisCalibration(
-            x_points=x_points,
-            y_head_points=y_head_points,
-            y_npsh_points=y_npsh_points,
-            y_efficiency_points=y_eff_points
-        )
-
-        print("\n✅ Calibration complete!")
         return True
 
     def px_to_real(self, x_px: int, y_px: int, axis_type: str = 'head') -> Tuple[float, float]:
@@ -593,49 +599,60 @@ class PumpCurveDigitizer:
 
     def get_pump_info(self):
         """
-        Gather pump metadata from the user.
+        Gather pump metadata from the user with confirmation.
         Asks for pump model, rated speed (rpm), pump type (single/multi-stage),
         and whether impeller trimming is allowed (for single-stage).
+        User can re-enter all data if not satisfied.
         """
         print("\nℹ️ PUMP INFORMATION")
+        while True:
+            # Request pump model
+            self.pump_model = input("Enter pump model (e.g., NSC125-80-210): ").strip()
+            # Request rated speed (rpm)
+            rpm_str = input("Enter rated speed (rpm) (e.g., 2980, 1450, 980, 740): ").strip()
+            try:
+                self.rpm = int(rpm_str)
+            except ValueError:
+                print("⚠️ Invalid number, setting rpm to 0.")
+                self.rpm = 0
 
-        # Request pump model (e.g., "NSC125-80-210")
-        self.pump_model = input("Enter pump model (e.g., NSC125-80-210): ").strip()
+            # Ask for pump type
+            pump_type_input = input("Pump type: (s)ingle-stage with impeller trimming, (m)ulti-stage? ").strip().lower()
+            self.pump_type = "single" if pump_type_input.startswith('s') else "multi"
+            print(f"   Pump type: {'single-stage' if self.pump_type == 'single' else 'multi-stage'}")
 
-        # Request rated speed (rpm)
-        rpm_str = input("Enter rated speed (rpm) (e.g., 2980, 1450, 980, 740): ").strip()
-        try:
-            self.rpm = int(rpm_str)
-        except ValueError:
-            print("⚠️ Invalid number, setting rpm to 0.")
-            self.rpm = 0
+            # For single-stage, ask about trimming
+            if self.pump_type == "single":
+                trim = input("Can impeller be trimmed to match duty point? (y/n): ").strip().lower()
+                self.trim_allowed = (trim == 'y')
+            else:
+                self.trim_allowed = False
 
-        # Ask for pump type
-        pump_type_input = input("Pump type: (s)ingle-stage with impeller trimming, (m)ulti-stage? ").strip().lower()
-        self.pump_type = "single" if pump_type_input.startswith('s') else "multi"
-        print(f"✅ Pump type: {'single-stage' if self.pump_type == 'single' else 'multi-stage'}")
+            # Display entered data for confirmation
+            print("\n📋 Entered pump information:")
+            print(f"   Model: {self.pump_model}")
+            print(f"   RPM: {self.rpm}")
+            print(f"   Type: {'single-stage' if self.pump_type == 'single' else 'multi-stage'}")
+            if self.pump_type == "single":
+                print(f"   Trim allowed: {self.trim_allowed}")
 
-        # For single-stage, ask about trimming
-        if self.pump_type == "single":
-            trim = input("Can impeller be trimmed to match duty point? (y/n): ").strip().lower()
-            self.trim_allowed = (trim == 'y')
-        else:
-            self.trim_allowed = False  # Not applicable for multi-stage
-
-        # Confirm the entered data
-        print(
-            f"✅ Pump model: {self.pump_model}, rpm: {self.rpm}, type: {self.pump_type}, trim_allowed={self.trim_allowed}")
+            confirm = input("Is this information correct? (y/n): ").strip().lower()
+            if confirm == 'y':
+                print("✅ Pump information confirmed.")
+                break
+            else:
+                print("🔄 Please re-enter pump information.")
 
     def digitize_curves(self):
         """
         Digitize all curves for a single pump with multiple variants (impeller diameters or stages).
 
         Steps for each variant:
-            - Q-H curve (mandatory)
-            - NPSH curve (optional)
-            - Efficiency points (optional)
-        The user clicks points along the curve; 'c' finishes the current curve.
-        All points are stored in the corresponding curve objects.
+            - Q-H curve (mandatory) – with undo (u/backspace) and confirmation
+            - NPSH curve (optional) – with undo and confirmation
+            - Efficiency points (optional) – collected point by point with console input, then confirmation
+
+        All points are stored in the corresponding curve objects only after user confirmation.
         """
         print("\n📊 STEP 3: Digitize Curves")
         print("\nNow we will digitize curves for different variants.")
@@ -667,11 +684,9 @@ class PumpCurveDigitizer:
             self.current_variant_value = variant_value
             self.current_variant_type = variant_type
 
-            # --- Digitize Q-H curve ---
-            print(f"\n  Now digitize the Q-H curve for {variant_label}.")
-            print("  Click points along the curve. Include start and end.")
-            print("  Press 'c' when done with this curve.")
-
+            # ------------------------------------------------------------
+            # Digitize Q-H curve (with confirmation loop)
+            # ------------------------------------------------------------
             pump_curve = PumpCurve(
                 name=f"Pump_{curve_idx + 1}",
                 pump_number=curve_idx + 1,
@@ -679,75 +694,100 @@ class PumpCurveDigitizer:
                 variant_value=variant_value,
                 color=self.colors['pump']
             )
-            self.pump_curves.append(pump_curve)
 
-            points_temp = []  # temporary storage for points of this curve
+            while True:  # loop until user confirms Q-H curve
+                print(f"\n  Now digitize the Q-H curve for {variant_label}.")
+                print("  Click points along the curve. Include start and end.")
+                print("  Press 'c' when done with this curve, 'u' to undo last point.")
 
-            def mouse_callback_qh(event, x, y, flags, param):
-                # Store mouse position for zoom (using display coordinates)
-                self.last_mouse_x, self.last_mouse_y = x, y
+                points_temp = []  # temporary storage for points of this curve (original coords)
 
-                # Convert to original coordinates for storing points
-                orig_x, orig_y = self._to_original_coords(x, y)
+                # Define mouse callback for Q-H (uses points_temp)
+                def mouse_callback_qh(event, x, y, flags, param):
+                    # Store mouse position for zoom panel
+                    self.last_mouse_x, self.last_mouse_y = x, y
+                    # Convert to original coordinates
+                    orig_x, orig_y = self._to_original_coords(x, y)
 
-                if event == cv2.EVENT_LBUTTONDOWN:
-                    points_temp.append((orig_x, orig_y))
+                    if event == cv2.EVENT_LBUTTONDOWN:
+                        points_temp.append((orig_x, orig_y))
 
-                # Update display - convert stored original points back to display coordinates
-                img_disp = self.image.copy()
-                for (px, py) in points_temp:
-                    disp_x, disp_y = self._to_display_coords(px, py)
-                    cv2.circle(img_disp, (disp_x, disp_y), 4, self.colors['pump'], -1)
-
-                if len(points_temp) > 1:
-                    # Convert all points to display coordinates for polyline
-                    display_pts = []
+                    # Redraw display
+                    img_disp = self.image.copy()
                     for (px, py) in points_temp:
                         disp_x, disp_y = self._to_display_coords(px, py)
-                        display_pts.append([disp_x, disp_y])
-                    pts = np.array(display_pts, np.int32)
-                    cv2.polylines(img_disp, [pts], False, self.colors['pump'], 2)
+                        cv2.circle(img_disp, (disp_x, disp_y), 4, self.colors['pump'], -1)
+                    if len(points_temp) > 1:
+                        # Convert all points to display coordinates for polyline
+                        display_pts = [self._to_display_coords(px, py) for (px, py) in points_temp]
+                        pts = np.array(display_pts, np.int32)
+                        cv2.polylines(img_disp, [pts], False, self.colors['pump'], 2)
 
-                # Show variant label
-                variant_label = f"{self.current_variant_value}{'mm' if self.current_variant_type == 'diameter' else ' stages'}"
+                    cv2.putText(img_disp, f"{variant_label} - Q-H", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['pump'], 2)
+                    cv2.putText(img_disp, f"Points: {len(points_temp)}", (10, 60),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                    cv2.putText(img_disp, "Press 'c' when done, 'u' to undo", (10, 85),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+                    if 0 <= x < self.image.shape[1] and 0 <= y < self.image.shape[0]:
+                        self.draw_zoom_panel(img_disp, x, y)
+
+                    cv2.imshow(self.window_name, img_disp)
+
+                cv2.setMouseCallback(self.window_name, mouse_callback_qh)
+
+                # Initial display with instructions
+                img_disp = self.image.copy()
                 cv2.putText(img_disp, f"{variant_label} - Q-H", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['pump'], 2)
-                cv2.putText(img_disp, f"Points: {len(points_temp)}", (10, 60),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-
-                # Draw zoom panel if mouse is inside image (using display coordinates)
-                if 0 <= x < self.image.shape[1] and 0 <= y < self.image.shape[0]:
-                    self.draw_zoom_panel(img_disp, x, y)
-
+                cv2.putText(img_disp, "Click points, press 'c' when done, 'u' to undo", (10, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                 cv2.imshow(self.window_name, img_disp)
 
-            cv2.setMouseCallback(self.window_name, mouse_callback_qh)
+                # Wait for user to finish this curve
+                while True:
+                    key = cv2.waitKey(100) & 0xFF
+                    if key == ord('c'):
+                        break
+                    elif key == ord('u') or key == 8:  # undo last point
+                        if points_temp:
+                            points_temp.pop()
+                            # redraw after undo
+                            img_disp = self.image.copy()
+                            for (px, py) in points_temp:
+                                disp_x, disp_y = self._to_display_coords(px, py)
+                                cv2.circle(img_disp, (disp_x, disp_y), 4, self.colors['pump'], -1)
+                            if len(points_temp) > 1:
+                                display_pts = [self._to_display_coords(px, py) for (px, py) in points_temp]
+                                pts = np.array(display_pts, np.int32)
+                                cv2.polylines(img_disp, [pts], False, self.colors['pump'], 2)
+                            cv2.putText(img_disp, f"{variant_label} - Q-H", (10, 30),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['pump'], 2)
+                            cv2.putText(img_disp, f"Points: {len(points_temp)}", (10, 60),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                            cv2.putText(img_disp, "Press 'c' when done, 'u' to undo", (10, 85),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                            self.draw_zoom_panel(img_disp, self.last_mouse_x, self.last_mouse_y)
+                            cv2.imshow(self.window_name, img_disp)
 
-            # Initial display with instructions
-            img_disp = self.image.copy()
-            cv2.putText(img_disp, f"{variant_label} - Q-H", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['pump'], 2)
-            cv2.putText(img_disp, "Click points, press 'c' when done", (10, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-            cv2.imshow(self.window_name, img_disp)
+                # Ask for confirmation
+                if self._confirm_step(f"Q-H curve for {variant_label}"):
+                    # Store points permanently
+                    for (x, y) in points_temp:
+                        pump_curve.add_point(x, y)
+                    self.pump_curves.append(pump_curve)
+                    break  # exit the Q-H confirmation loop
+                else:
+                    print("🔄 Redoing Q-H curve...")
+                    # loop continues, points_temp discarded
 
-            # Wait for user to finish this curve
-            while True:
-                key = cv2.waitKey(100) & 0xFF
-                if key == ord('c'):
-                    break
-
-            # Store collected points into the curve object
-            for (x, y) in points_temp:
-                pump_curve.add_point(x, y)
-
-            # --- Optionally digitize NPSH curve ---
+            # ------------------------------------------------------------
+            # Optionally digitize NPSH curve (with confirmation loop)
+            # ------------------------------------------------------------
             has_npsh = input(
                 f"\n  Does this variant ({variant_label}) have an NPSH curve? (y/n): ").strip().lower() == 'y'
             if has_npsh:
-                print(f"  Now digitize the NPSH curve for {variant_label}.")
-                print("  Click points, press 'c' when done.")
-
                 npsh_curve = NPSHCurve(
                     name=f"NPSH_{curve_idx + 1}",
                     pump_number=curve_idx + 1,
@@ -755,169 +795,177 @@ class PumpCurveDigitizer:
                     variant_value=variant_value,
                     color=self.colors['npsh']
                 )
-                self.npsh_curves.append(npsh_curve)
-
-                points_npsh = []
-
-                def mouse_callback_npsh(event, x, y, flags, param):
-                    """
-                    Mouse callback for digitizing NPSH curve points.
-                    Uses nonlocal variables: points_npsh, npsh_curve, diam, variant_label.
-                    """
-                    # Store mouse position for zoom panel (display coordinates)
-                    self.last_mouse_x, self.last_mouse_y = x, y
-
-                    # Convert to original coordinates for storing
-                    orig_x, orig_y = self._to_original_coords(x, y)
-
-                    if event == cv2.EVENT_LBUTTONDOWN:
-                        points_npsh.append((orig_x, orig_y))
-
-                    # Update display: convert stored original points to display coordinates
-                    img_disp = self.image.copy()
-                    for (px, py) in points_npsh:
-                        disp_x, disp_y = self._to_display_coords(px, py)
-                        cv2.circle(img_disp, (disp_x, disp_y), 4, self.colors['npsh'], -1)
-
-                    if len(points_npsh) > 1:
-                        # Convert all points to display coordinates for polyline
-                        display_pts = []
-                        for (px, py) in points_npsh:
-                            disp_x, disp_y = self._to_display_coords(px, py)
-                            display_pts.append([disp_x, disp_y])
-                        pts = np.array(display_pts, np.int32)
-                        cv2.polylines(img_disp, [pts], False, self.colors['npsh'], 2)
-
-                    # Show instructions
-                    cv2.putText(img_disp, f"{variant_label} - NPSH", (10, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['npsh'], 2)
-                    cv2.putText(img_disp, f"Points: {len(points_npsh)}", (10, 60),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-                    cv2.putText(img_disp, "Press 'c' when done", (10, 85),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-
-                    # Draw zoom panel if mouse is inside image (display coordinates)
-                    if 0 <= x < self.image.shape[1] and 0 <= y < self.image.shape[0]:
-                        self.draw_zoom_panel(img_disp, x, y)
-
-                    cv2.imshow(self.window_name, img_disp)
-
-                cv2.setMouseCallback(self.window_name, mouse_callback_npsh)
-
-                img_disp = self.image.copy()
-                cv2.putText(img_disp, f"{variant_label} - NPSH", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['npsh'], 2)
-                cv2.putText(img_disp, "Click points, press 'c' when done", (10, 60),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-                cv2.imshow(self.window_name, img_disp)
 
                 while True:
-                    key = cv2.waitKey(100) & 0xFF
-                    if key == ord('c'):
+                    print(f"  Now digitize the NPSH curve for {variant_label}.")
+                    print("  Click points, press 'c' when done, 'u' to undo.")
+
+                    points_npsh = []
+
+                    def mouse_callback_npsh(event, x, y, flags, param):
+                        self.last_mouse_x, self.last_mouse_y = x, y
+                        orig_x, orig_y = self._to_original_coords(x, y)
+
+                        if event == cv2.EVENT_LBUTTONDOWN:
+                            points_npsh.append((orig_x, orig_y))
+
+                        img_disp = self.image.copy()
+                        for (px, py) in points_npsh:
+                            disp_x, disp_y = self._to_display_coords(px, py)
+                            cv2.circle(img_disp, (disp_x, disp_y), 4, self.colors['npsh'], -1)
+                        if len(points_npsh) > 1:
+                            display_pts = [self._to_display_coords(px, py) for (px, py) in points_npsh]
+                            pts = np.array(display_pts, np.int32)
+                            cv2.polylines(img_disp, [pts], False, self.colors['npsh'], 2)
+
+                        cv2.putText(img_disp, f"{variant_label} - NPSH", (10, 30),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['npsh'], 2)
+                        cv2.putText(img_disp, f"Points: {len(points_npsh)}", (10, 60),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                        cv2.putText(img_disp, "Press 'c' when done, 'u' to undo", (10, 85),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+                        if 0 <= x < self.image.shape[1] and 0 <= y < self.image.shape[0]:
+                            self.draw_zoom_panel(img_disp, x, y)
+
+                        cv2.imshow(self.window_name, img_disp)
+
+                    cv2.setMouseCallback(self.window_name, mouse_callback_npsh)
+
+                    img_disp = self.image.copy()
+                    cv2.putText(img_disp, f"{variant_label} - NPSH", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['npsh'], 2)
+                    cv2.putText(img_disp, "Click points, press 'c' when done, 'u' to undo", (10, 60),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    cv2.imshow(self.window_name, img_disp)
+
+                    while True:
+                        key = cv2.waitKey(100) & 0xFF
+                        if key == ord('c'):
+                            break
+                        elif key == ord('u') or key == 8:
+                            if points_npsh:
+                                points_npsh.pop()
+                                # redraw (simplified: just call callback with a dummy event? better redraw manually)
+                                img_disp = self.image.copy()
+                                for (px, py) in points_npsh:
+                                    disp_x, disp_y = self._to_display_coords(px, py)
+                                    cv2.circle(img_disp, (disp_x, disp_y), 4, self.colors['npsh'], -1)
+                                if len(points_npsh) > 1:
+                                    display_pts = [self._to_display_coords(px, py) for (px, py) in points_npsh]
+                                    pts = np.array(display_pts, np.int32)
+                                    cv2.polylines(img_disp, [pts], False, self.colors['npsh'], 2)
+                                cv2.putText(img_disp, f"{variant_label} - NPSH", (10, 30),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['npsh'], 2)
+                                cv2.putText(img_disp, f"Points: {len(points_npsh)}", (10, 60),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                                cv2.putText(img_disp, "Press 'c' when done, 'u' to undo", (10, 85),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                                self.draw_zoom_panel(img_disp, self.last_mouse_x, self.last_mouse_y)
+                                cv2.imshow(self.window_name, img_disp)
+
+                    if self._confirm_step(f"NPSH curve for {variant_label}"):
+                        for (x, y) in points_npsh:
+                            npsh_curve.add_point(x, y)
+                        self.npsh_curves.append(npsh_curve)
                         break
+                    else:
+                        print("🔄 Redoing NPSH curve...")
 
-                for (x, y) in points_npsh:
-                    npsh_curve.add_point(x, y)
-
-            # --- Optionally digitize efficiency points ---
+            # ------------------------------------------------------------
+            # Optionally digitize efficiency points (with confirmation loop)
+            # ------------------------------------------------------------
             has_eff = input(f"\n  Are there efficiency points for {variant_label}? (y/n): ").strip().lower() == 'y'
             if has_eff:
-                print(f"  Now click on the Q-H curve at points where efficiency is known.")
-                print("  For each click, enter the efficiency value.")
+                while True:
+                    print(f"  Now click on the Q-H curve at points where efficiency is known.")
+                    print("  For each click, enter the efficiency value.")
+                    print("  Press 'c' when done collecting points.")
 
-                points_eff = []
+                    points_eff = []  # list of (x_px, y_px, eff_value)
 
-                def mouse_callback_eff(event, x, y, flags, param):
-                    """
-                    Mouse callback for digitizing efficiency points.
-                    Clicks should be made on the Q-H curve; user is prompted to enter efficiency value.
-                    Uses nonlocal variables: points_eff, pump_curve, diam, variant_label.
-                    """
-                    # Store mouse position for zoom panel (display coordinates)
-                    self.last_mouse_x, self.last_mouse_y = x, y
+                    def mouse_callback_eff(event, x, y, flags, param):
+                        self.last_mouse_x, self.last_mouse_y = x, y
+                        orig_x, orig_y = self._to_original_coords(x, y)
 
-                    # Convert to original coordinates for storing
-                    orig_x, orig_y = self._to_original_coords(x, y)
+                        if event == cv2.EVENT_LBUTTONDOWN:
+                            val = input(f"    Efficiency at this point (%): ").strip()
+                            try:
+                                eff_val = float(val)
+                                points_eff.append((orig_x, orig_y, eff_val))
+                            except ValueError:
+                                print("    Invalid number, skipping.")
 
-                    if event == cv2.EVENT_LBUTTONDOWN:
-                        val = input(f"    Efficiency at this point (%): ").strip()
-                        try:
-                            eff_val = float(val)
-                            points_eff.append((orig_x, orig_y, eff_val))
-                        except ValueError:
-                            print("    Invalid number, skipping.")
+                        # Update display
+                        img_disp = self.image.copy()
+                        # Show Q-H curve in background (already stored permanently)
+                        for pt in pump_curve.points:
+                            disp_x, disp_y = self._to_display_coords(pt.x_px, pt.y_px)
+                            cv2.circle(img_disp, (disp_x, disp_y), 4, self.colors['pump'], -1)
+                        if len(pump_curve.points) > 1:
+                            pts_disp = [self._to_display_coords(pt.x_px, pt.y_px) for pt in pump_curve.points]
+                            pts = np.array(pts_disp, np.int32)
+                            cv2.polylines(img_disp, [pts], False, self.colors['pump'], 2)
 
-                    # Update display
+                        # Show efficiency points already collected
+                        for (px, py, ev) in points_eff:
+                            disp_x, disp_y = self._to_display_coords(px, py)
+                            cv2.circle(img_disp, (disp_x, disp_y), 6, self.colors['efficiency'], 2)
+                            cv2.putText(img_disp, f"{ev}%", (disp_x + 10, disp_y - 10),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.colors['efficiency'], 1)
+
+                        cv2.putText(img_disp, f"{variant_label} - Click on Q-H curve for efficiency", (10, 30),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.colors['efficiency'], 2)
+                        cv2.putText(img_disp, f"Points: {len(points_eff)}", (10, 60),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                        cv2.putText(img_disp, "Press 'c' when done", (10, 85),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+                        if 0 <= x < self.image.shape[1] and 0 <= y < self.image.shape[0]:
+                            self.draw_zoom_panel(img_disp, x, y)
+
+                        cv2.imshow(self.window_name, img_disp)
+
+                    cv2.setMouseCallback(self.window_name, mouse_callback_eff)
+
+                    # Show the Q-H curve as a guide
                     img_disp = self.image.copy()
-
-                    # Show Q-H curve in background (using stored original points of pump_curve)
                     for pt in pump_curve.points:
                         disp_x, disp_y = self._to_display_coords(pt.x_px, pt.y_px)
                         cv2.circle(img_disp, (disp_x, disp_y), 4, self.colors['pump'], -1)
-
                     if len(pump_curve.points) > 1:
-                        # Convert all pump curve points to display coordinates for polyline
-                        display_pts = []
-                        for pt in pump_curve.points:
-                            disp_x, disp_y = self._to_display_coords(pt.x_px, pt.y_px)
-                            display_pts.append([disp_x, disp_y])
-                        pts = np.array(display_pts, np.int32)
+                        pts_disp = [self._to_display_coords(pt.x_px, pt.y_px) for pt in pump_curve.points]
+                        pts = np.array(pts_disp, np.int32)
                         cv2.polylines(img_disp, [pts], False, self.colors['pump'], 2)
-
-                    # Show efficiency points already collected
-                    for (px, py, ev) in points_eff:
-                        disp_x, disp_y = self._to_display_coords(px, py)
-                        cv2.circle(img_disp, (disp_x, disp_y), 6, self.colors['efficiency'], 2)
-                        cv2.putText(img_disp, f"{ev}%", (disp_x + 10, disp_y - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.colors['efficiency'], 1)
-
-                    # Instructions
                     cv2.putText(img_disp, f"{variant_label} - Click on Q-H curve for efficiency", (10, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.colors['efficiency'], 2)
-                    cv2.putText(img_disp, f"Points: {len(points_eff)}", (10, 60),
+                    cv2.putText(img_disp, "Press 'c' when done", (10, 60),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-                    cv2.putText(img_disp, "Press 'c' when done", (10, 85),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-
-                    # Draw zoom panel if mouse is inside image (display coordinates)
-                    if 0 <= x < self.image.shape[1] and 0 <= y < self.image.shape[0]:
-                        self.draw_zoom_panel(img_disp, x, y)
-
                     cv2.imshow(self.window_name, img_disp)
 
-                cv2.setMouseCallback(self.window_name, mouse_callback_eff)
+                    # Wait for user to finish
+                    while True:
+                        key = cv2.waitKey(100) & 0xFF
+                        if key == ord('c'):
+                            break
 
-                # Show the Q-H curve as a guide
-                img_disp = self.image.copy()
-                for pt in pump_curve.points:
-                    cv2.circle(img_disp, (pt.x_px, pt.y_px), 4, self.colors['pump'], -1)
-                if len(pump_curve.points) > 1:
-                    pts = np.array([[p.x_px, p.y_px] for p in pump_curve.points], np.int32)
-                    cv2.polylines(img_disp, [pts], False, self.colors['pump'], 2)
-                cv2.putText(img_disp, f"{variant_label} - Click on Q-H curve for efficiency", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.colors['efficiency'], 2)
-                cv2.putText(img_disp, "Press 'c' when done", (10, 60),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-                cv2.imshow(self.window_name, img_disp)
-
-                while True:
-                    key = cv2.waitKey(100) & 0xFF
-                    if key == ord('c'):
+                    if self._confirm_step(f"Efficiency points for {variant_label}"):
+                        # Store points permanently
+                        for (x, y, val) in points_eff:
+                            self.efficiency_points.append(
+                                EfficiencyPoint(
+                                    pump_curve_name=pump_curve.name,
+                                    pump_number=curve_idx + 1,
+                                    variant_type=variant_type,
+                                    variant_value=variant_value,
+                                    x_px=x,
+                                    y_px=y,
+                                    efficiency_value=val
+                                )
+                            )
                         break
-
-                # Store efficiency points
-                for (x, y, val) in points_eff:
-                    self.efficiency_points.append(
-                        EfficiencyPoint(
-                            pump_curve_name=pump_curve.name,
-                            pump_number=curve_idx + 1,
-                            variant_type=variant_type,
-                            variant_value=variant_value,
-                            x_px=x,
-                            y_px=y,
-                            efficiency_value=val
-                        )
-                    )
+                    else:
+                        print("🔄 Redoing efficiency points...")
 
             # Reset mouse callback after finishing this variant
             cv2.setMouseCallback(self.window_name, lambda *args: None)
